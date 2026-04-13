@@ -1,40 +1,49 @@
 # Terminal Clicker
 
-Keep Claude agents moving in terminal windows by automating clicks and keyboard input.
+Keep Claude agents moving in terminal windows without interfering with your work.
 
-## ⚠️ IMPORTANT: Two Versions
+## 🎯 The Right Way: Background Daemon
 
-### 1. **Simple Clicker** (`terminal_clicker.py`)
-```python
-tc = TerminalClicker(x=640, y=400)
-tc.click_and_press("enter")  # Dumb key pressing
-tc.monitor_and_click(interval=5, duration=600)  # Blind timer
+**Don't run a blocking monitor.** Use the **background daemon** that:
+- ✅ Runs in background (doesn't block your work)
+- ✅ Pauses when you're actively using computer
+- ✅ Only acts on terminals when they're paused
+- ✅ You can start/stop anytime
+- ✅ Logs everything
+
+```bash
+# Start daemon (runs in background, doesn't block)
+python3 launch_daemon.py start --x 640 --y 400 --goal "Deploy code"
+
+# Check status while working
+python3 launch_daemon.py status
+
+# View logs
+python3 launch_daemon.py logs
+
+# Stop when done
+python3 launch_daemon.py stop
 ```
-**Use for:** Quick automation where you just need to press keys repeatedly
-
-### 2. **Smart Monitor** (`smart_terminal_monitor.py`) ⭐ RECOMMENDED
-```python
-monitor = SmartTerminalMonitor(
-    terminal_position=(640, 400),
-    agent_goal="Deploy code and report status"
-)
-monitor.run(duration=600, check_interval=5)  # Vision AI powered
-```
-**Use for:** Actually managing Claude agents - takes screenshots, understands state, makes intelligent decisions
 
 ---
 
-## The Difference
+## How It Works
 
-| Feature | Simple Clicker | Smart Monitor |
-|---------|---|---|
-| How it works | Timer → Press key | Screenshot → Vision AI → Decide → Act |
-| Understands state? | ❌ No | ✅ Yes |
-| Detects errors? | ❌ No | ✅ Yes |
-| Adapts to situation? | ❌ No | ✅ Yes |
-| Guides stuck agents? | ❌ No | ✅ Yes |
-| Logs decisions? | ❌ No | ✅ Yes |
-| Escapes infinity loops? | ❌ No | ✅ Yes |
+```
+Background Daemon (doesn't block you)
+  ↓
+Every 5 seconds:
+  - Takes screenshot (non-blocking)
+  - Checks if you're using computer
+    - If YES: pauses, waits
+    - If NO: analyzes terminal with vision AI
+  - If agent paused/stuck: acts (press key, type, send guidance)
+  - If agent running: waits
+  ↓
+Logs everything to ~/.terminal_monitor/
+```
+
+The key: **It pauses when you're working** so it doesn't interfere.
 
 ---
 
@@ -43,99 +52,94 @@ monitor.run(duration=600, check_interval=5)  # Vision AI powered
 ```bash
 git clone https://github.com/colt-netizen/terminal-clicker.git
 cd terminal-clicker
-```
 
-### For Smart Monitor (Recommended)
-
-```bash
-# Set your OpenAI API key
+# Requires OPENAI_API_KEY for smart analysis
 export OPENAI_API_KEY="sk-..."
-
-# Run the smart monitor
-python3 smart_terminal_monitor.py
 ```
 
-### For Simple Clicker
+---
+
+## Quick Start
+
+### Start the daemon
 
 ```bash
-# Just run it
-python3 terminal_clicker.py demo
+python3 launch_daemon.py start \
+  --x 640 \
+  --y 400 \
+  --goal "Deploy the latest code and report status"
+```
+
+That's it. Now it runs in background. You can:
+- Work on other stuff
+- Close the terminal
+- Use your computer normally
+
+The daemon keeps monitoring without interfering.
+
+### Check status
+
+```bash
+python3 launch_daemon.py status
+```
+
+Output:
+```
+✅ Daemon running
+   Status: monitoring
+   Iteration: 42
+   Last update: 2025-04-12T22:45:30
+```
+
+### View logs
+
+```bash
+python3 launch_daemon.py logs --tail 20
+```
+
+### Stop daemon
+
+```bash
+python3 launch_daemon.py stop
 ```
 
 ---
 
-## Quick Start - Smart Monitor
+## What the Daemon Does
 
-```python
-from smart_terminal_monitor import SmartTerminalMonitor
-import os
-
-# Get API key
-api_key = os.environ.get("OPENAI_API_KEY")
-
-# Create monitor
-monitor = SmartTerminalMonitor(
-    terminal_position=(640, 400),
-    agent_goal="Deploy the latest code to production",
-    vision_api_key=api_key
-)
-
-# Run for 10 minutes, checking every 5 seconds
-monitor.run(duration=600, check_interval=5)
+### When Agent is Running
+```
+→ Takes screenshot
+→ Analyzes: "Agent running, don't interrupt"
+→ Waits 5 seconds
+→ Repeats
 ```
 
-The monitor will:
-1. **Take a screenshot every 5 seconds**
-2. **Send to vision AI** (OpenAI GPT-4 Vision)
-3. **Understand the current state** (running, paused, error, blocked, complete)
-4. **Make intelligent decisions:**
-   - If agent paused → press appropriate key
-   - If agent asking for input → provide response
-   - If error → retry if safe, escalate if not
-   - If stuck → send guidance to agent
-   - If running → don't interrupt
-5. **Log everything** to `~/terminal_monitor.jsonl`
-
----
-
-## How Smart Monitor Works
-
-### The Loop
-
+### When Agent is Paused
 ```
-Screenshot → Vision AI Analysis → Parse Response → Make Decision → Act → Wait → Repeat
+→ Takes screenshot
+→ Analyzes: "Agent paused at 'Do you want to proceed?'"
+→ Presses Enter
+→ Waits 5 seconds
+→ Checks again
 ```
 
-### Example Scenario
-
-**Agent is stuck deploying code:**
-
+### When Agent Asks for Input
 ```
-1. Screenshot shows: "ERROR: Connection timeout, retry? (y/n)"
-2. Vision AI says: "Status=ERROR, Recoverable, recommend=Retry"
-3. Smart Monitor decides: "Error is recoverable, press Enter to retry"
-4. Monitor acts: Presses Enter
-5. Agent retries and succeeds
+→ Takes screenshot
+→ Analyzes: "Agent asking 'Which branch?' - needs input"
+→ Types "main" and presses Enter
+→ Waits 5 seconds
+→ Checks again
 ```
 
-**Agent is asking for input:**
-
+### When Agent Hits Error
 ```
-1. Screenshot shows: "Which environment? (dev/staging/prod)"
-2. Vision AI says: "Status=PAUSED, recommend=Type 'prod'"
-3. Smart Monitor decides: "Type 'prod' and press Enter"
-4. Monitor acts: Types response
-5. Agent continues with production deployment
-```
-
-**Agent is running but stuck:**
-
-```
-1. Screenshot shows: Command running, no prompt
-2. Vision AI says: "Status=BLOCKED, not making progress"
-3. After 3 checks, Smart Monitor decides: "Send guidance"
-4. Monitor acts: Sends "Next step toward goal: [what to do next]"
-5. Agent receives guidance and gets unstuck
+→ Takes screenshot
+→ Analyzes: "Error detected - recoverable"
+→ Presses Enter to retry
+→ Waits 5 seconds
+→ If error again: escalates (stops and alerts you)
 ```
 
 ---
@@ -144,151 +148,232 @@ Screenshot → Vision AI Analysis → Parse Response → Make Decision → Act �
 
 ### Terminal Position
 
-Find your terminal's position (pixels from top-left):
+Find your terminal's pixel position (from top-left):
 
-```python
-# Center of screen (most common)
-terminal_position=(640, 400)
+```bash
+# Center of screen (default)
+python3 launch_daemon.py start --x 640 --y 400
 
-# Left third (left terminal)
-terminal_position=(200, 400)
+# Left third
+python3 launch_daemon.py start --x 200 --y 400
 
-# Right third (right terminal)
-terminal_position=(1000, 400)
+# Right third
+python3 launch_daemon.py start --x 1000 --y 400
 ```
 
-### Check Interval
+### Goal (what agent is trying to do)
 
-```python
-# Very frequent monitoring (every 2 seconds)
-monitor.run(duration=600, check_interval=2)
-
-# Normal (every 5 seconds)
-monitor.run(duration=600, check_interval=5)
-
-# Less frequent (every 10 seconds)
-monitor.run(duration=600, check_interval=10)
+```bash
+python3 launch_daemon.py start \
+  --x 640 \
+  --y 400 \
+  --goal "Run integration tests and report results"
 ```
 
-### Duration
-
-```python
-# Monitor for 5 minutes
-monitor.run(duration=300)
-
-# Monitor for 30 minutes
-monitor.run(duration=1800)
-
-# Monitor indefinitely (until task completes or error)
-monitor.run(duration=86400)  # 24 hours
-```
+Agent's goal helps vision AI understand context better.
 
 ---
 
-## Vision AI Setup
+## How It Pauses for Your Work
 
-### OpenAI (Recommended)
+The daemon detects if you're actively using the computer:
+- Watches mouse movement
+- Pauses if you move mouse (you're working)
+- Resumes after 5 seconds of inactivity
 
-1. Get API key from https://platform.openai.com/api-keys
-2. Export it:
-   ```bash
-   export OPENAI_API_KEY="sk-..."
-   ```
-3. Smart monitor uses it automatically
-
-### Claude / Anthropic (Future)
-
-Will work with Claude's vision API when integrated:
-
-```python
-monitor = SmartTerminalMonitor(
-    vision_model="claude-vision",
-    vision_api_key=anthropic_key
-)
-```
+So you can:
+- Type commands
+- Click around
+- Work normally
+- Daemon waits for you to stop, then monitors again
 
 ---
 
 ## Logs
 
-Every decision is logged to `~/terminal_monitor.jsonl`:
+All monitoring is logged to `~/.terminal_monitor/`
 
-```json
-{"timestamp": "2025-04-12T22:45:30", "iteration": 1, "action": "pressed_enter", "status": "PAUSED_PROMPT"}
-{"timestamp": "2025-04-12T22:45:35", "iteration": 2, "action": "wait", "status": "RUNNING"}
-{"timestamp": "2025-04-12T22:45:40", "iteration": 3, "action": "typed_response", "status": "PAUSED_PROMPT"}
+```
+daemon.log           - Main log
+status.json          - Current status
+last_screenshot.png  - Last screenshot taken
+monitor_*.jsonl      - Detailed monitoring history
 ```
 
-Analyze with:
+### View recent logs
 
 ```bash
-# See all actions
-cat ~/terminal_monitor.jsonl | jq .
+# Last 50 lines
+python3 launch_daemon.py logs
+
+# Last 100 lines
+python3 launch_daemon.py logs --tail 100
+
+# All logs
+cat ~/.terminal_monitor/daemon.log
+```
+
+### Analyze detailed history
+
+```bash
+# See all actions taken
+cat ~/.terminal_monitor/monitor_*.jsonl | jq .
 
 # See only errors
-cat ~/terminal_monitor.jsonl | jq 'select(.action | contains("error"))'
+cat ~/.terminal_monitor/monitor_*.jsonl | jq 'select(.level=="ERROR")'
 
-# Count actions
-cat ~/terminal_monitor.jsonl | jq -s 'group_by(.action) | map({action: .[0].action, count: length})'
+# See status changes
+cat ~/.terminal_monitor/monitor_*.jsonl | jq 'select(.message | contains("Status"))'
+```
+
+---
+
+## Comparison: Blocking vs Daemon
+
+### ❌ Blocking (old way)
+```python
+monitor = SmartTerminalMonitor(...)
+monitor.run(duration=600)  # Takes over your screen for 10 minutes
+```
+
+Problem: You can't do anything while it's running.
+
+### ✅ Daemon (right way)
+```bash
+python3 launch_daemon.py start
+# You can keep working!
+```
+
+Benefit: Daemon monitors in background, you keep working.
+
+---
+
+## Examples
+
+### Deploy code while you work
+
+```bash
+# Start daemon
+python3 launch_daemon.py start \
+  --x 640 --y 400 \
+  --goal "Deploy latest code to production and report status"
+
+# Now work on other stuff
+# Daemon monitors deployment in background
+# Check progress anytime: python3 launch_daemon.py status
+
+# When done
+python3 launch_daemon.py stop
+```
+
+### Run tests and monitor
+
+```bash
+python3 launch_daemon.py start \
+  --x 640 --y 400 \
+  --goal "Run full test suite and report results"
+
+# Keep working...
+# Daemon handles interactive prompts automatically
+```
+
+### Multiple terminals
+
+```bash
+# Monitor left terminal
+python3 launch_daemon.py start --x 200 --y 400 --goal "Task 1" &
+
+# Monitor center terminal
+python3 launch_daemon.py start --x 640 --y 400 --goal "Task 2" &
+
+# Monitor right terminal
+python3 launch_daemon.py start --x 1000 --y 400 --goal "Task 3" &
+
+# All three run in background, you can work normally
 ```
 
 ---
 
 ## Troubleshooting
 
-### "No OPENAI_API_KEY set"
+### Daemon not responding
 
 ```bash
-export OPENAI_API_KEY="sk-your-key-here"
-python3 smart_terminal_monitor.py
+# Check status
+python3 launch_daemon.py status
+
+# View logs
+python3 launch_daemon.py logs
+
+# Restart
+python3 launch_daemon.py restart
 ```
 
-### Terminal clicks not working
+### Not detecting agent state correctly
 
-- Verify terminal is visible and at correct position
-- Check (x, y) coordinates are correct
-- Try adding delay: modify script, increase `delay` from 0.3 to 0.5
+The daemon uses vision AI (OpenAI). Make sure:
+```bash
+echo $OPENAI_API_KEY  # Should have a key
+```
 
-### Vision AI errors
+Without API key, daemon runs in "mock mode" (doesn't actually help).
 
-- Check API key is valid
-- Ensure you have API credits
-- Check network connection
-- Try again (API timeouts are temporary)
+### Daemon interfering with your work
 
----
+That means `pause_on_activity` isn't working. The daemon should pause when you move your mouse.
 
-## Examples
-
-See `EXAMPLES.md` for:
-- Multi-terminal monitoring
-- Custom guidance prompts
-- Integration with your agent workflow
-- Error handling patterns
-- Deployment automation
+If it's not, you can:
+```bash
+python3 launch_daemon.py stop
+# Then restart
+```
 
 ---
 
-## When to Use Smart Monitor
+## Advanced: Custom Start Script
 
-✅ Claude agents in terminals
-✅ Long-running tasks
-✅ Interactive workflows (need input)
-✅ Error-prone deployments
-✅ Multi-step processes
+Instead of command line, create a script:
 
-❌ Simple key pressing (use Simple Clicker)
-❌ No vision API available (use Simple Clicker)
-❌ Tasks that never need input (use Simple Clicker)
+```bash
+#!/bin/bash
+# deploy_with_monitoring.sh
+
+# Start daemon
+python3 launch_daemon.py start \
+  --x 640 --y 400 \
+  --goal "Deploy code to production"
+
+# Run deployment in the terminal
+# Daemon monitors in background
+
+# When deployment finishes (or after timeout)
+sleep 600
+python3 launch_daemon.py stop
+```
+
+---
+
+## API Key Setup
+
+```bash
+# Get key from https://platform.openai.com/api-keys
+export OPENAI_API_KEY="sk-..."
+
+# Add to ~/.bashrc or ~/.zshrc to persist
+echo 'export OPENAI_API_KEY="sk-..."' >> ~/.bashrc
+source ~/.bashrc
+```
 
 ---
 
 ## License
 
-MIT - Free to use, modify, share
+MIT - Free to use and modify
 
 ---
 
 ## Questions?
 
-Check EXAMPLES.md for more patterns or open an issue on GitHub.
+Check the logs: `cat ~/.terminal_monitor/daemon.log`
+
+Or view examples in EXAMPLES.md
