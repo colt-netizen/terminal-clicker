@@ -393,3 +393,58 @@ test('the bare LA in a scorebug does not hijack matching', () => {
   // CHC alone is unambiguous and carries the match.
   assert.strictEqual(Intel.matchGameByText(GAMES, 'LA 1 CHC 0 IMANAGA P: 11'), GAMES[1]);
 });
+
+// --- concatenated rail text (textContent strips whitespace between elements) ---
+
+test('rail states parse from concatenated card text', () => {
+  assert.strictEqual(Intel.parseRailState('FinalTORHOU').kind, 'final');
+  assert.strictEqual(Intel.parseRailState('Bot 8SDViewingAZ').kind, 'live');
+  assert.strictEqual(Intel.parseRailState('1:20 PMSFTEX').kind, 'preview');
+});
+
+// --- replay mode tuning ---
+
+const ALL_FINAL = [
+  game(2, LAD, CHC, FINAL),
+  game(3, SF, TEX, FINAL),
+  game(30, team('NYM', 'Mets', 'New York'), team('CLE', 'Guardians', 'Cleveland'), FINAL),
+];
+
+test('replay night, all panes on break slates: loads another finished game', () => {
+  const target = Intel.pickTuneTarget({
+    panes: [
+      { inBreak: true, gamePk: 2, expendable: true },
+      { inBreak: true, gamePk: 3, expendable: true },
+    ],
+    games: ALL_FINAL,
+    railCards: [{ tokens: ['NYM', 'CLE'], viewing: false, text: 'FinalNYMCLE' }],
+    teamPriorities: [],
+    replayMode: true,
+  });
+  assert.ok(target, 'the all-break deadlock must be escaped');
+  assert.strictEqual(target.gamePk, 30);
+});
+
+test('replay night with a watchable replay: nothing is expendable, no tune', () => {
+  const target = Intel.pickTuneTarget({
+    panes: [
+      { inBreak: true, gamePk: 2, expendable: false },
+      { inBreak: false, gamePk: 3, expendable: false },
+    ],
+    games: ALL_FINAL,
+    railCards: [{ tokens: ['NYM', 'CLE'], viewing: false, text: 'FinalNYMCLE' }],
+    teamPriorities: [],
+    replayMode: true,
+  });
+  assert.strictEqual(target, null);
+});
+
+test('normal mode never proposes final games even with expendable panes', () => {
+  const target = Intel.pickTuneTarget({
+    panes: [{ live: false, inBreak: false, gamePk: 1 }, { live: true, gamePk: 4 }],
+    games: [GAMES[1]], // only a final exists off-screen
+    railCards: [{ tokens: ['LAD', 'CHC'], viewing: false, text: 'FinalLADCHC' }],
+    teamPriorities: [],
+  });
+  assert.strictEqual(target, null);
+});

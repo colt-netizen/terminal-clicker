@@ -205,6 +205,7 @@ function paneList(tabId, now, teamPriorities) {
         key: pane.key,
         label: pane.label,
         tokens: tokens || [],
+        text: pane.text || '',
         inBreak: Boolean(pane.inBreak),
         isPrimary: frame.primaryLocal === local,
         gamePk: game ? game.gamePk : null,
@@ -356,12 +357,51 @@ async function maybeTune(tabId, panes, settings, now) {
     else tuneFailures.delete(gamePk);
   }
 
+  const games = scheduleGames();
+  const replayMode =
+    schedule.fetchedAt > 0 &&
+    games.length > 0 &&
+    !games.some((g) => ['live', 'paused'].includes(Intel.classifyApiGame(g)));
+
+  /**
+   * What may be given up. Normally: dead panes only, never breaks. In replay
+   * mode every pane reads "dead", so the rules are the pane's own content:
+   * filler feeds are expendable, and if EVERY pane is a break slate at once
+   * (nothing watchable at all), the deadlock makes them all expendable —
+   * loading a different replay beats a wall of "Commercial Break in Progress".
+   */
+  let expendable;
+  if (!replayMode) {
+    expendable = (p) => !p.live && !p.inBreak;
+  } else {
+    const allBreak = panes.every((p) => p.inBreak);
+    expendable = allBreak ? () => true : (p) => !p.inBreak && Intel.looksLikeFiller(p.text);
+  }
+
+  // Rail token extraction is loose (uppercase runs in concatenated text), so
+  // keep only tokens that are real team abbreviations before matching.
+  const knownAbbrs = new Set(
+    games.flatMap((g) => [g.teams.away.team.abbreviation, g.teams.home.team.abbreviation])
+      .map(Intel.normalizeToken)
+  );
+  const cards = rail.cards.map((c) => ({
+    text: c.text,
+    viewing: c.viewing,
+    tokens: (c.tokens || []).filter((t) => knownAbbrs.has(Intel.normalizeToken(t))),
+  }));
+
   const target = Intel.pickTuneTarget({
-    panes: panes.map((p) => ({ live: p.live, inBreak: p.inBreak, gamePk: p.gamePk })),
-    games: scheduleGames(),
-    railCards: rail.cards.map((c) => ({ tokens: c.tokens, viewing: c.viewing, text: c.text })),
+    panes: panes.map((p) => ({
+      live: p.live,
+      inBreak: p.inBreak,
+      gamePk: p.gamePk,
+      expendable: expendable(p),
+    })),
+    games,
+    railCards: cards,
     teamPriorities: settings.teamPriorities,
     skipGamePks: skip,
+    replayMode,
   });
   if (!target) return null;
 
@@ -369,7 +409,7 @@ async function maybeTune(tabId, panes, settings, now) {
   lastTune.set(tabId, now);
 
   const give = panes[target.replaceIndex];
-  const card = rail.cards[target.cardIndex];
+  const card = cards[target.cardIndex];
   // Focus the pane being replaced first — MLB loads a rail selection into the
   // focused pane — then click the card. The coordinator handles the pacing.
   if (give) {
@@ -401,13 +441,16 @@ async function evaluate(tabId, { audioDead, blocked }) {
   if (blocked || panes.length < 2) return { switched: false };
   if (!settings.enabled) return { switched: false };
 
-  // The user's click is the strongest ranking there is. It holds until that
-  // pane's game stops being live baseball, then normal rules resume.
+  // The user's click is the strongest ranking there is. It holds as long as
+  // the pane exists — on replay nights every pane reads "not live", and
+  // dropping the hold for that would un-stick the user's choice the moment
+  // they made it. A held pane that goes truly dead simply stops being an
+  // eligible destination, which retires the hold without ceremony.
   let heldKey = null;
   const hold = manualHold.get(tabId);
   if (hold) {
     const held = panes.find((p) => p.key === hold.key);
-    if (!held || held.notLive) manualHold.delete(tabId);
+    if (!held) manualHold.delete(tabId);
     else heldKey = hold.key;
   }
 

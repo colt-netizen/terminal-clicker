@@ -52,9 +52,12 @@
       rank: rankOf(pane.key, priorities),
     }));
 
-    const available = ranked.filter((p) => !p.inBreak && !p.notLive && !p.paused);
-    // Every game is on a break at once. Moving would only trade one break for
-    // another, so hold and let the caller back off.
+    const liveAvailable = ranked.filter((p) => !p.inBreak && !p.notLive && !p.paused);
+    // Nothing on screen is live baseball — a replay night (every game final),
+    // or every live pane is between innings. The user still chose these feeds,
+    // so the job degrades to keeping the audio off the break slates: anything
+    // that is not a "Commercial Break in Progress" screen is watchable.
+    const available = liveAvailable.length ? liveAvailable : ranked.filter((p) => !p.inBreak);
     if (!available.length) return null;
 
     // Lowest rank wins; ties fall back to display order so the choice is stable.
@@ -72,7 +75,10 @@
     const other = pick(alternatives);
 
     if (current.inBreak) return { index: other.index, reason: 'current pane is on a commercial break' };
-    if (current.notLive) {
+    // A dead pane is only worth leaving for genuinely live baseball. When the
+    // alternatives are just other replays, moving between them gains nothing —
+    // and would bounce forever, since they are all equally dead.
+    if (current.notLive && liveAvailable.length) {
       return { index: other.index, reason: current.notLiveReason || 'current pane is not live baseball' };
     }
     if (other.rank < current.rank) return { index: other.index, reason: 'a higher-priority game is available' };

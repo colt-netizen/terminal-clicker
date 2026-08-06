@@ -20,10 +20,13 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   // ------------------------------------------------------------ rail text
 
-  const INNING = /\b(top|bot(?:tom)?|mid(?:dle)?|end)\s*(\d{1,2})\b/i;
-  const FINAL = /\bfinal\b/i;
-  const NOT_PLAYING = /\b(postponed|ppd|suspended|delay|delayed|warmup|pre-?game)\b/i;
-  const START_TIME = /\b(\d{1,2}:\d{2}\s*(?:am|pm)?)\b/i;
+  // No word boundaries: rail card text arrives via textContent, which
+  // concatenates child elements without whitespace ("FinalTORHOU"), so \b
+  // never fires where humans see a break.
+  const INNING = /(top|bot(?:tom)?|mid(?:dle)?|end)\s*(\d{1,2})/i;
+  const FINAL = /final/i;
+  const NOT_PLAYING = /postponed|ppd|suspended|delay|warmup|pre-?game/i;
+  const START_TIME = /(\d{1,2}:\d{2}\s*(?:am|pm)?)/i;
 
   /**
    * Classify one rail card's text. "Bot 8" style inning markers win over
@@ -259,6 +262,11 @@
   /** Pane text that means "this feed is filler, not baseball". */
   const PREGAME_TEXT = /\b(coming up|first pitch|lineups|pregame|postgame|game over|watch live|starts? (at|in))\b/i;
 
+  /** Exposed so the worker can spot filler feeds in replay mode. */
+  function looksLikeFiller(text) {
+    return PREGAME_TEXT.test(String(text || ''));
+  }
+
   /**
    * Is actual baseball playing on this pane right now?
    *
@@ -299,13 +307,17 @@
    * priorities pick the winner. Returns the rail card to click and the pane to
    * give up, or null.
    */
-  function pickTuneTarget({ panes, games, railCards, teamPriorities, skipGamePks }) {
-    // Only truly dead panes are up for replacement. A commercial break is NOT
-    // dead — that game is about to come back, and replacing (or even focusing)
-    // its pane is exactly the "it clicked into the break window" bug.
+  function pickTuneTarget({ panes, games, railCards, teamPriorities, skipGamePks, replayMode }) {
+    // Only expendable panes are up for replacement. The caller may mark them
+    // explicitly (replay mode has its own rules); the default is truly dead
+    // panes only. A commercial break is NOT dead — that game is about to come
+    // back, and replacing (or even focusing) its pane is exactly the "it
+    // clicked into the break window" bug.
     const deadPanes = (panes || [])
       .map((pane, index) => ({ pane, index }))
-      .filter(({ pane }) => !pane.live && !pane.inBreak);
+      .filter(({ pane }) =>
+        pane.expendable !== undefined ? pane.expendable : !pane.live && !pane.inBreak
+      );
     if (!deadPanes.length) return null;
 
     const onScreen = new Set(
@@ -313,19 +325,23 @@
     );
     const skip = new Set(skipGamePks || []);
 
+    // On a replay night there is nothing live to load — the watchable games
+    // are the finished ones the user hasn't put on screen.
+    const wantKind = replayMode ? 'final' : 'live';
+
     /**
-     * A card is clickable for a game only if its own printed state agrees the
-     * game is on ("Bot 3", or unparseable text we defer to the API on). This
-     * is what disambiguates doubleheaders: both cards carry the same team
-     * tokens, but only one says an inning while the other says Final.
+     * A card is clickable for a game only if its own printed state agrees
+     * ("Bot 3" for live hunting, "Final" for replay hunting; unparseable text
+     * defers to the API). This is what disambiguates doubleheaders: both cards
+     * carry the same team tokens but print different states.
      */
     const cardShowsPlayable = (c) => {
       const kind = parseRailState(c.text || '').kind;
-      return kind === 'live' || kind === 'unknown';
+      return kind === wantKind || kind === 'unknown';
     };
 
     const candidates = (games || [])
-      .filter((g) => classifyApiGame(g) === 'live')
+      .filter((g) => classifyApiGame(g) === wantKind)
       .filter((g) => !onScreen.has(g.gamePk) && !skip.has(g.gamePk))
       .map((g) => {
         const card = (railCards || []).findIndex(

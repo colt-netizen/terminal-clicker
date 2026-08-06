@@ -182,14 +182,62 @@ test('never selects a notLive pane as the destination', () => {
   assert.strictEqual(result.index, 2, 'b is dead even though it outranks c');
 });
 
-test('holds when every alternative is dead, even mid-break', () => {
+test('a break slate loses to a dead-but-watchable pane (replay fallback)', () => {
+  // Replay night: the user's chosen replays all read "not live". Sitting on a
+  // "Commercial Break in Progress" slate while a replay plays next door is
+  // wrong — anything that is not a break screen is watchable.
   const result = choose({
-    panes: [pane('a', true), { key: 'b', notLive: true }],
+    panes: [pane('a', true), { key: 'b', notLive: true, notLiveReason: 'no live MLB games right now' }],
     priorities: ['a', 'b'],
     currentIndex: 0,
     audioDead: true,
   });
+  assert.strictEqual(result.index, 1);
+});
+
+test('replays do not bounce among themselves', () => {
+  // Both panes are dead replays, neither in break: moving gains nothing.
+  const result = choose({
+    panes: [
+      { key: 'a', notLive: true },
+      { key: 'b', notLive: true },
+    ],
+    priorities: ['a', 'b'],
+    currentIndex: 0,
+    audioDead: false,
+  });
   assert.strictEqual(result, null);
+});
+
+test('a replay yields the moment genuinely live baseball appears', () => {
+  const result = choose({
+    panes: [{ key: 'replay', notLive: true }, pane('livegame')],
+    priorities: [],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result.index, 1);
+});
+
+test('replay night: leaves a break and returns when the break ends', () => {
+  const during = choose({
+    panes: [{ key: 'fav', inBreak: true }, { key: 'other', notLive: true }],
+    priorities: ['fav'],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(during.index, 1, 'leave the slate for the watchable replay');
+
+  const after = choose({
+    panes: [
+      { key: 'fav', notLive: true },
+      { key: 'other', notLive: true },
+    ],
+    priorities: ['fav'],
+    currentIndex: 1,
+    audioDead: false,
+  });
+  assert.strictEqual(after.index, 0, 'ranked favourite pulls the audio back');
 });
 
 // --- paused: between half-innings (destination filter only) ---
@@ -232,12 +280,14 @@ test('return-to-favourite waits until the favourite is back in action', () => {
   assert.strictEqual(resumed.index, 0, 'favourite resumed — go back');
 });
 
-test('holds through a break when every alternative is between innings', () => {
+test('a break falls back to a between-innings pane when nothing is mid-action', () => {
+  // Both are ad windows, but the paused pane has baseball seconds away —
+  // better than a static break slate.
   const result = choose({
     panes: [pane('a', true), { key: 'b', paused: true }],
     priorities: ['a', 'b'],
     currentIndex: 0,
     audioDead: true,
   });
-  assert.strictEqual(result, null);
+  assert.strictEqual(result.index, 1);
 });

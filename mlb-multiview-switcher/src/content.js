@@ -176,13 +176,16 @@
   // team abbreviations. It is both a state source and a control surface: the
   // worker asks us to click a card to load that game into the focused pane.
 
-  const RAIL_STATE = /\b(?:top|bot(?:tom)?|mid(?:dle)?|end)\s*\d{1,2}\b|\bfinal\b|\bppd\b|\bpostponed\b|\bdelay|\bsuspended\b|\bwarmup\b|\b\d{1,2}:\d{2}\s*(?:am|pm)\b/i;
+  // No word boundaries anywhere here: textContent concatenates child elements
+  // without whitespace, so a card reads "FinalTORHOU" — \b never fires where a
+  // human sees a break. That was why the rail scan found 0 cards.
+  const RAIL_STATE = /(?:top|bot(?:tom)?|mid(?:dle)?|end)\s*\d{1,2}|final|ppd|postponed|delay|suspended|warmup|\d{1,2}:\d{2}\s*(?:am|pm)?/i;
   const NOT_TEAM_TOKENS = new Set(['AM', 'PM', 'ET', 'PT', 'CT', 'MT', 'TV', 'PPD', 'TBD', 'MLB']);
 
+  /** Uppercase runs in concatenated text: "FinalTORHOU" -> TOR, HOU. Noise
+   * tokens get through; the worker filters against real team abbreviations. */
   function railTokens(text) {
-    return [...String(text).matchAll(/\b[A-Z]{2,3}\b/g)]
-      .map((m) => m[0])
-      .filter((t) => !NOT_TEAM_TOKENS.has(t));
+    return (String(text).match(/[A-Z]{2,3}/g) || []).filter((t) => !NOT_TEAM_TOKENS.has(t));
   }
 
   /**
@@ -204,7 +207,7 @@
       candidates = [];
       for (const el of document.querySelectorAll('a, button, li, div')) {
         const text = (el.textContent || '').trim();
-        if (text.length < 4 || text.length > 60) continue;
+        if (text.length < 4 || text.length > 80) continue;
         if (!RAIL_STATE.test(text)) continue;
         if (railTokens(text).length < 2) continue;
         candidates.push(el);

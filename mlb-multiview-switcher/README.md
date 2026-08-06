@@ -27,6 +27,15 @@ A pane counts as **live baseball** only if: it has no break banner, its matched
 game is In Progress (not Final, not pre-game, not rain-delayed), and it isn't
 showing filler ("Coming Up", "First Pitch…").
 
+**Replay nights work too.** When the stats API says nothing is live anywhere
+(late night, watching archived games), the rules degrade gracefully instead of
+freezing: any pane that isn't a "Commercial Break in Progress" slate counts as
+watchable, breaks still trigger switches (and return when they end), team
+priorities still rank the replays, dead air still rotates — and auto-tune hunts
+*finished* games off the rail instead of live ones, including escaping the
+all-panes-on-break deadlock. Live-only behaviors (live-edge seeking) simply
+don't engage, so replay positions are never touched.
+
 One asymmetric rule squeezes out extra seconds of baseball without any
 flapping: a game sitting **between half-innings** (the API's `Middle`/`End`
 inning state — the broadcast's commercial window) is never *chosen as a
