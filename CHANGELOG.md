@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `mlb-multiview-switcher/` — a Chromium MV3 extension, independent of the
+  Python tooling. Watches an MLB.tv multiview tab and promotes another pane
+  when the one carrying audio goes quiet. Detection uses Chrome's per-tab
+  `audible` flag rather than a Web Audio analyser, because MLB.tv is Widevine
+  protected. See `mlb-multiview-switcher/README.md`.
+
 ## [1.0.0] - 2025-04-12
 
 ### Added
