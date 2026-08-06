@@ -103,6 +103,7 @@ async function start({ streamId, tabId, cfg, band }) {
         speechPresent: latest.speechPresent,
         recentDb: Math.round(latest.recentDb * 10) / 10,
         floorDb: Math.round(latest.floorDb * 10) / 10,
+        spreadDb: Math.round(latest.spreadDb * 10) / 10,
       })
       .catch(() => {});
   }, REPORT_MS);

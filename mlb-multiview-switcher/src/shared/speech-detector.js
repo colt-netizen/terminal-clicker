@@ -33,9 +33,22 @@
     // Energy is averaged over this window before comparison, so single-frame
     // spikes (bat crack, crowd surge) don't read as speech.
     recentMs: 700,
+    // Modulation window. Speech is bursts and gaps — words swing the level by
+    // 15dB+ within a second and a half. A commercial slate's stadium murmur is
+    // a drone: loud or quiet, its level barely moves. Requiring spread kills
+    // the failure mode where silence sank the floor and then ANY steady murmur
+    // measured "far above floor" for minutes (observed live: a -56dB slate
+    // read as speech over a -84dB floor). No absolute level can separate the
+    // two — slates range from -80 to -55dB — but flatness always can.
+    spreadWindowMs: 1500,
+    // Loud-to-quiet swing (p90 - p10) the window must show to count as speech.
+    spreadDb: 8,
     // Frames quieter than this are treated as true silence regardless of floor,
     // which stops the floor chasing digital silence down to -Infinity.
     absoluteFloorDb: -95,
+    // Sanity gate only: below this nothing is speech (digital-silence jitter
+    // can technically "spread").
+    minSpeechDb: -80,
   };
 
   function create(options) {
@@ -43,7 +56,7 @@
     return {
       cfg,
       floorDb: null,
-      recent: [], // {t, db}
+      recent: [], // {t, db} — spans spreadWindowMs
       lastT: null,
     };
   }
@@ -55,23 +68,38 @@
     return total / values.length;
   }
 
+  function percentile(sorted, p) {
+    if (!sorted.length) return 0;
+    const i = Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * p)));
+    return sorted[i];
+  }
+
   /**
    * Feed one measurement.
+   *
+   * Speech requires all three: level above the adaptive floor, level above the
+   * absolute sanity gate, and — the one that actually separates commentary
+   * from a slate's crowd drone — modulation: the window must swing between
+   * loud and quiet the way words do.
    *
    * @param {object} state  from create()
    * @param {number} db     speech-band energy for this frame, in dBFS
    * @param {number} now    ms timestamp
-   * @returns {{speechPresent: boolean, floorDb: number, recentDb: number}}
+   * @returns {{speechPresent: boolean, floorDb: number, recentDb: number, spreadDb: number}}
    */
   function push(state, db, now) {
     const { cfg } = state;
     const level = Math.max(db, cfg.absoluteFloorDb);
 
     state.recent.push({ t: now, db: level });
-    const cutoff = now - cfg.recentMs;
-    while (state.recent.length && state.recent[0].t < cutoff) state.recent.shift();
+    const windowCutoff = now - cfg.spreadWindowMs;
+    while (state.recent.length && state.recent[0].t < windowCutoff) state.recent.shift();
 
-    const recentDb = mean(state.recent.map((r) => r.db));
+    const meanCutoff = now - cfg.recentMs;
+    const recentDb = mean(state.recent.filter((r) => r.t >= meanCutoff).map((r) => r.db));
+
+    const sorted = state.recent.map((r) => r.db).sort((a, b) => a - b);
+    const spreadDb = percentile(sorted, 0.9) - percentile(sorted, 0.1);
 
     if (state.floorDb === null) {
       state.floorDb = level;
@@ -88,9 +116,13 @@
     state.lastT = now;
 
     return {
-      speechPresent: recentDb > state.floorDb + cfg.marginDb,
+      speechPresent:
+        recentDb > state.floorDb + cfg.marginDb &&
+        recentDb > cfg.minSpeechDb &&
+        spreadDb >= cfg.spreadDb,
       floorDb: state.floorDb,
       recentDb,
+      spreadDb,
     };
   }
 

@@ -30,7 +30,7 @@ function renderStatus(state) {
     return;
   }
   const signal = state.listening
-    ? `speech ${state.recentDb}dB / floor ${state.floorDb}dB`
+    ? `speech ${state.recentDb}dB spread ${state.spreadDb ?? '?'}dB / floor ${state.floorDb}dB`
     : 'tab audio flag';
   const lines = [
     `panes    ${state.totalPanes}`,
@@ -38,6 +38,8 @@ function renderStatus(state) {
     `signal   ${signal}`,
     `phase    ${state.stale ? 'not running' : state.phase}`,
   ];
+  if (state.replayMode) lines.push('mode     replay night — non-break panes are watchable');
+  if (state.viewing && state.viewing.length) lines.push(`viewing  ${state.viewing.join(', ')}`);
   if (state.games && state.games.apiError) lines.push(`api      ${state.games.apiError}`);
   if (state.tuneTripped) lines.push('tune     paused — rail clicks not landing');
   box.textContent = lines.join('\n');
@@ -104,7 +106,7 @@ function renderPanes(state) {
     li.appendChild(el('span', 'pane-name', pane.label));
     if (pane.stateText) li.appendChild(tag(pane.stateText));
     if (pane.inBreak) li.appendChild(tag('break'));
-    else if (!pane.live) li.appendChild(tag('dead'));
+    else if (!pane.live) li.appendChild(tag(state.replayMode ? 'replay' : 'dead'));
     if (pane.isPrimary) li.appendChild(tag('audio', true));
     list.appendChild(li);
   }

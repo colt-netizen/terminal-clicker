@@ -56,6 +56,14 @@ const SPEECH_TTL_MS = 2000;
  * until the reports caught up.
  */
 const SWITCH_COOLDOWN_MS = 2500;
+/**
+ * Minimum time audio stays where it was put before *dead air* is allowed to
+ * move it again. Definite facts (a break banner, a game going final) still act
+ * after the ordinary cooldown — but the audio detector, which can be wrong,
+ * gets at most one move per dwell. This is the guarantee that the user hears a
+ * game rather than a slideshow of stuttering samples when detection misfires.
+ */
+const AUDIO_DWELL_MS = 20000;
 
 /** tabId -> timestamp of the last promotion. */
 const lastSwitch = new Map();
@@ -135,6 +143,37 @@ function scheduleGames() {
   return schedule.games;
 }
 
+/** Zero live baseball anywhere (and the API is actually answering): the user
+ * is watching replays, and the replay rules apply. */
+function isReplayContext(games) {
+  return (
+    schedule.fetchedAt > 0 &&
+    games.length > 0 &&
+    !games.some((g) => ['live', 'paused'].includes(Intel.classifyApiGame(g)))
+  );
+}
+
+function knownAbbrSet(games) {
+  return new Set(
+    games
+      .flatMap((g) => [g.teams.away.team.abbreviation, g.teams.home.team.abbreviation])
+      .map(Intel.normalizeToken)
+  );
+}
+
+/** "TOR @ HOU" style matchups for the rail cards marked Viewing — which games
+ * the page says are on screen, even when panes can't be matched individually. */
+function viewingMatchups(tabId, now) {
+  const rail = rails.get(tabId);
+  if (!rail || now - rail.ts > FRAME_TTL_MS) return [];
+  const known = knownAbbrSet(scheduleGames());
+  return rail.cards
+    .filter((c) => c.viewing)
+    .map((c) => (c.tokens || []).filter((t) => known.has(Intel.normalizeToken(t))))
+    .filter((tokens) => tokens.length === 2)
+    .map((tokens) => tokens.join(' @ '));
+}
+
 // ---------------------------------------------------------------- pane roster
 
 function frameMap(tabId) {
@@ -199,11 +238,15 @@ function paneList(tabId, now, teamPriorities) {
       if (liveness.live && leagueDead) {
         liveness = { live: false, reason: 'no live MLB games right now' };
       }
+      const away = game && game.teams.away.team;
+      const home = game && game.teams.home.team;
       out.push({
         frameId: frame.frameId,
         local,
         key: pane.key,
-        label: pane.label,
+        label: game
+          ? `${away.abbreviation || away.teamName} @ ${home.abbreviation || home.teamName}`
+          : pane.label,
         tokens: tokens || [],
         text: pane.text || '',
         inBreak: Boolean(pane.inBreak),
@@ -248,6 +291,7 @@ function audioState(tabId, tabInfo, now) {
       source: 'speech',
       recentDb: heard.recentDb,
       floorDb: heard.floorDb,
+      spreadDb: heard.spreadDb,
       listening: true,
     };
   }
@@ -358,10 +402,7 @@ async function maybeTune(tabId, panes, settings, now) {
   }
 
   const games = scheduleGames();
-  const replayMode =
-    schedule.fetchedAt > 0 &&
-    games.length > 0 &&
-    !games.some((g) => ['live', 'paused'].includes(Intel.classifyApiGame(g)));
+  const replayMode = isReplayContext(games);
 
   /**
    * What may be given up. Normally: dead panes only, never breaks. In replay
@@ -380,10 +421,7 @@ async function maybeTune(tabId, panes, settings, now) {
 
   // Rail token extraction is loose (uppercase runs in concatenated text), so
   // keep only tokens that are real team abbreviations before matching.
-  const knownAbbrs = new Set(
-    games.flatMap((g) => [g.teams.away.team.abbreviation, g.teams.home.team.abbreviation])
-      .map(Intel.normalizeToken)
-  );
+  const knownAbbrs = knownAbbrSet(games);
   const cards = rail.cards.map((c) => ({
     text: c.text,
     viewing: c.viewing,
@@ -466,11 +504,14 @@ async function evaluate(tabId, { audioDead, blocked }) {
 
   let switched = { switched: false };
   if (now - (lastSwitch.get(tabId) || 0) >= SWITCH_COOLDOWN_MS) {
+    const sinceSwitch = now - (lastSwitch.get(tabId) || 0);
     const decision = Selector.choose({
       panes,
       priorities,
       currentIndex: currentIndex(tabId, panes),
-      audioDead,
+      // Dead air may only move the audio once per dwell window; definite
+      // signals (breaks, dead games) keep the ordinary cooldown.
+      audioDead: audioDead && sinceSwitch >= AUDIO_DWELL_MS,
     });
     if (decision) {
       const result = await promoteIndex(tabId, panes, decision.index);
@@ -650,6 +691,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           })),
           railCards: rail && now - rail.ts <= FRAME_TTL_MS ? rail.cards.length : 0,
           apiGames: schedule.games.length,
+          replayMode: isReplayContext(scheduleGames()),
+          viewing: viewingMatchups(tabId, now),
           tuneTripped: tuneTripped.has(tabId),
         };
       });
@@ -666,6 +709,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         speechPresent: msg.speechPresent,
         recentDb: msg.recentDb,
         floorDb: msg.floorDb,
+        spreadDb: msg.spreadDb,
         ts: Date.now(),
       });
       return false;
@@ -707,6 +751,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             live: p.live,
           })),
           games: gamesForPopup(),
+          replayMode: isReplayContext(scheduleGames()),
+          viewing: viewingMatchups(msg.tabId, now),
           tuneTripped: tuneTripped.has(msg.tabId),
           phase: known ? known.phase : 'unknown',
           stale: !known || now - known.ts > FRAME_TTL_MS,

@@ -47,6 +47,44 @@
     ]);
   }
 
+  // ------------------------------------------------------------ deep DOM
+  //
+  // MLB's player is built from web components: the videos sit in the light
+  // DOM (so pane counting always worked) but overlays, banners and the rail
+  // live inside shadow roots, which querySelectorAll and TreeWalker silently
+  // skip. Every scan that kept "finding nothing that was visibly on screen"
+  // — rail 0 cards, break slates never marked — was this.
+
+  /** querySelectorAll that descends into open shadow roots. */
+  function deepQueryAll(selector, root = document, out = []) {
+    for (const el of root.querySelectorAll(selector)) out.push(el);
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) deepQueryAll(selector, el.shadowRoot, out);
+    }
+    return out;
+  }
+
+  /** Visible-ish text of a subtree including shadow content, space-joined. */
+  function deepText(node, limit) {
+    const parts = [];
+    let length = 0;
+    const visit = (n) => {
+      if (length >= limit) return;
+      if (n.nodeType === Node.TEXT_NODE) {
+        const value = (n.nodeValue || '').trim();
+        if (value) {
+          parts.push(value);
+          length += value.length + 1;
+        }
+        return;
+      }
+      if (n.shadowRoot) visit(n.shadowRoot);
+      for (const child of n.childNodes) visit(child);
+    };
+    visit(node);
+    return parts.join(' ').slice(0, limit);
+  }
+
   // ---------------------------------------------------------------- panes
 
   const area = (r) => r.width * r.height;
@@ -76,8 +114,9 @@
   }
 
   function paneText(container) {
-    const text = container.innerText || container.textContent || '';
-    return text.slice(0, TEXT_SCAN_LIMIT);
+    // deepText, not innerText: pane overlays live in shadow roots that
+    // innerText does not include.
+    return deepText(container, TEXT_SCAN_LIMIT);
   }
 
   function breakPattern() {
@@ -96,7 +135,7 @@
   function derivePaneKey(container, index) {
     // Team logos carry alt text; two of them make a recognisable matchup and
     // give the worker tokens to match against the stats API's team names.
-    const alts = [...container.querySelectorAll('img[alt]')]
+    const alts = deepQueryAll('img[alt]', container)
       .map((img) => img.alt.trim())
       .filter((alt) => alt && alt.length < 40);
     const tokens = alts.slice(0, 2);
@@ -185,15 +224,22 @@
    */
   function breakOverlayRects(pattern) {
     const rects = [];
-    const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      if (!pattern.test(node.nodeValue || '')) continue;
-      const el = node.parentElement;
-      if (!el) continue;
-      const r = el.getBoundingClientRect();
-      if (r.width > 0 && r.height > 0) rects.push(r);
-    }
+    const scanRoot = (root) => {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          if (!pattern.test(node.nodeValue || '')) continue;
+          const el = node.parentElement;
+          if (!el) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) rects.push(r);
+        } else if (node.shadowRoot) {
+          scanRoot(node.shadowRoot); // TreeWalker will not descend on its own
+        }
+      }
+    };
+    scanRoot(document.body || document.documentElement);
     return rects;
   }
 
@@ -239,7 +285,7 @@
     }
     if (!candidates || !candidates.length) {
       candidates = [];
-      for (const el of document.querySelectorAll('a, button, li, div')) {
+      for (const el of deepQueryAll('a, button, li, div')) {
         const text = (el.textContent || '').trim();
         if (text.length < 4 || text.length > 80) continue;
         if (!RAIL_STATE.test(text)) continue;
@@ -411,15 +457,16 @@
     }
 
     const lines = [
-      `phase    ${machine.phase}`,
-      `signal   ${info.source}${info.listening ? ` ${info.recentDb}dB / floor ${info.floorDb}dB` : ''}`,
+      `phase    ${machine.phase}${info.replayMode ? '   mode replay-night' : ''}`,
+      `signal   ${info.source}${info.listening ? ` ${info.recentDb}dB spread ${info.spreadDb ?? '?'}dB / floor ${info.floorDb}dB` : ''}`,
       `audible  ${info.audible}`,
       `panes    ${info.totalPanes}   rail ${info.railCards ?? 0} cards   api ${info.apiGames ?? 0} games`,
     ];
+    if (info.viewing && info.viewing.length) lines.push(`viewing  ${info.viewing.join(', ')}`);
     (info.panes || []).forEach((p, i) => {
       const marks = [
         p.stateText || '?',
-        p.inBreak ? 'BREAK' : p.live ? 'live' : `dead: ${p.liveReason}`,
+        p.inBreak ? 'BREAK' : p.live ? 'live' : info.replayMode ? 'replay' : `dead: ${p.liveReason}`,
         p.isPrimary ? 'audio' : '',
       ].filter(Boolean);
       lines.push(`  ${i + 1}. ${p.label} [${marks.join(' | ')}]`);

@@ -140,3 +140,29 @@ test('bandEnergyDb survives -Infinity bins', () => {
   const bins = new Float32Array(1024).fill(-Infinity);
   assert.strictEqual(bandEnergyDb(bins, 48000, 2048), -Infinity);
 });
+
+// --- the slate-murmur failure observed live ---
+
+test('steady murmur after silence never reads as speech, at any loudness', () => {
+  // The live failure: silence sank the floor to -90, then a slate's flat
+  // -56dB crowd drone measured "27dB above floor" and read as speech for
+  // minutes. Flatness must veto it.
+  for (const murmur of [-75, -65, -56]) {
+    const levels = [...steady(-90, seconds(6)), ...steady(murmur, seconds(20))];
+    const { speechFraction } = feed(levels);
+    assert.strictEqual(speechFraction, 0, `flat ${murmur}dB drone must not be speech`);
+  }
+});
+
+test('commentary right after silence is still detected', () => {
+  const levels = [...steady(-90, seconds(6)), ...speechLike(-28, -50, seconds(10))];
+  const { speechFraction } = feed(levels);
+  assert.ok(speechFraction > 0.5, `expected speech after silence, got ${speechFraction}`);
+});
+
+test('slightly wavering murmur still fails the spread gate', () => {
+  // +-2dB wobble — far short of word-level modulation.
+  const levels = [...Array(seconds(20))].map((_, i) => -60 + (i % 3) - 1);
+  const { speechFraction } = feed(levels.map((v) => v));
+  assert.strictEqual(speechFraction, 0);
+});
