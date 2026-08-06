@@ -265,6 +265,7 @@ async function setListenMode(on) {
 
   $('enabled').checked = settings.enabled;
   $('autoTune').checked = settings.autoTune;
+  $('pushToMain').checked = settings.pushToMain !== false;
   $('listenMode').checked = settings.listenMode;
   renderTeams();
 
@@ -276,6 +277,11 @@ async function setListenMode(on) {
   $('autoTune').addEventListener('change', async () => {
     settings = { ...settings, autoTune: $('autoTune').checked };
     await Settings.save({ autoTune: settings.autoTune });
+  });
+
+  $('pushToMain').addEventListener('change', async () => {
+    settings = { ...settings, pushToMain: $('pushToMain').checked };
+    await Settings.save({ pushToMain: settings.pushToMain });
   });
 
   $('listenMode').addEventListener('change', () => setListenMode($('listenMode').checked));

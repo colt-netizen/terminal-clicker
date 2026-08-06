@@ -107,10 +107,17 @@
     if (current.notLive && liveAvailable.length) {
       return { index: other.index, reason: current.notLiveReason || 'current pane is not live baseball' };
     }
+    // An upgrade is optional — unlike an escape, there is never a reason to
+    // move INTO a heated pane. Without this, heat expiring is itself the
+    // upgrade trigger: the audio dives back into the silent favourite the
+    // moment its 150s ends, confirms dead air for 15s, escapes, reheats —
+    // a permanent loop the flight recorder showed running for hours (upgrades
+    // firing at sinceSwitchMs of exactly 150000).
     const upgradeAllowed =
-      allowUpgrade === undefined ||
-      allowUpgrade === true ||
-      (allowUpgrade === 'top' && other.rank === 0);
+      !other.heated &&
+      (allowUpgrade === undefined ||
+        allowUpgrade === true ||
+        (allowUpgrade === 'top' && other.rank === 0));
     if (other.rank < current.rank && upgradeAllowed) {
       return { index: other.index, reason: 'a higher-priority game is available' };
     }

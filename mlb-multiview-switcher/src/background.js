@@ -90,6 +90,13 @@ const DEAD_AIR_ESCAPE_MS = 45000;
  * the audio straight back into the slate.
  */
 const AUDIO_ESCAPE_HEAT_MS = 150000; // avg MLB ad pod (2:15-2:45) with margin
+// A pane escaped for silence AGAIN without ever producing speech in between is
+// not on an ad break — it is dead (a replay sitting past its end, a stalled
+// feed). Each consecutive strike doubles the heat, so the return-and-confirm
+// cycle backs off instead of burning 15 dead seconds every 150s forever.
+const AUDIO_ESCAPE_HEAT_MAX_MS = 20 * 60 * 1000;
+/** tabId -> Map<paneKey, consecutive silence-escapes with no speech between>. */
+const escapeStrikes = new Map();
 /**
  * A user clicking AWAY from a pane is the strongest break detector in the
  * system: they are looking at it. The abandoned pane is toxic waste for the
@@ -645,30 +652,132 @@ function currentIndex(tabId, panes) {
  */
 const manualHold = new Map();
 
+// The lock and the manual hold are the user's voice — they must survive
+// service-worker restarts and any in-memory reset. chrome.storage.session
+// lives exactly as long as the browser session, which is the right scope.
+function persistSessionState() {
+  try {
+    chrome.storage.session.set({
+      userLocks: Object.fromEntries(userLockUntil),
+      holds: Object.fromEntries([...manualHold].map(([t, h]) => [t, h.key])),
+    });
+  } catch {
+    // storage.session unavailable: in-memory state still works this lifetime.
+  }
+}
+
+function setUserLock(tabId, until) {
+  userLockUntil.set(tabId, until);
+  persistSessionState();
+}
+
+function setHold(tabId, key) {
+  manualHold.set(tabId, { key });
+  persistSessionState();
+}
+
+const stateReady = (async () => {
+  try {
+    const { userLocks, holds } = await chrome.storage.session.get(['userLocks', 'holds']);
+    for (const [t, until] of Object.entries(userLocks || {})) {
+      if (!userLockUntil.has(Number(t))) userLockUntil.set(Number(t), until);
+    }
+    for (const [t, key] of Object.entries(holds || {})) {
+      if (!manualHold.has(Number(t))) manualHold.set(Number(t), { key });
+    }
+  } catch {
+    // Nothing persisted yet.
+  }
+})();
+
 /** Move the audio to a specific pane. */
 async function promoteIndex(tabId, panes, index, options) {
   const target = panes[index];
   if (!target) return { ok: false, reason: 'pane index out of range' };
+  const prevCursor = cursor.has(tabId) ? cursor.get(tabId) : -1;
   cursor.set(tabId, index);
   lastSwitch.set(tabId, Date.now());
   lastAlive.set(tabId, Date.now()); // fresh pane, fresh evidence clock
   aliveScore.set(tabId, 0.5);
 
-  placedBy.set(tabId, (options && options.source) || 'extension');
+  const source = (options && options.source) || 'extension';
+  placedBy.set(tabId, source);
   const goLive = options && 'goLive' in options ? options.goLive : Boolean(target.gameLive);
-  const sends = liveFrames(tabId, Date.now()).map((frame) => {
-    const message =
-      frame.frameId === target.frameId
-        ? // goLive: for a game the API says is in progress, snap the feed to
-          // the live edge on arrival. Never for finals — that's someone's
-          // replay position.
-          { type: 'promote', local: target.local, goLive }
-        : { type: 'demote' };
-    return chrome.tabs
-      .sendMessage(tabId, message, { frameId: frame.frameId })
+  const send = (frameId, message) =>
+    chrome.tabs
+      .sendMessage(tabId, message, { frameId })
       .catch(() => null); // a frame can vanish mid-switch; not fatal
+
+  // Honour a content-side refusal by re-adopting the user's pane as cursor,
+  // hold and lock. The content script is the last line of defence: within a
+  // minute of a real click it refuses instructions that contradict the user,
+  // even when the worker's own lock and hold were lost (worker restart,
+  // spurious reset) — every lost-state incident showed up as audio being
+  // yanked seconds after a click.
+  const adoptRefusal = (frameId, refusal) => {
+    const kept = panes.findIndex((p) => p.frameId === frameId && p.local === refusal.local);
+    cursor.set(tabId, kept >= 0 ? kept : prevCursor);
+    if (kept >= 0) setHold(tabId, panes[kept].key);
+    setUserLock(tabId, Date.now() + USER_LOCK_MS);
+    placedBy.set(tabId, 'user');
+    logEvent(tabId, 'lock-refused', {
+      attempted: target.label,
+      kept: kept >= 0 ? panes[kept].label : null,
+    });
+    return { ok: false, reason: 'blocked by user lock' };
+  };
+  const isRefusal = (r) => r && r.ok === false && r.reason === 'user lock';
+
+  // Promote FIRST: if the target frame refuses, nothing has been demoted yet
+  // and the switch simply does not happen. goLive: for a game the API says is
+  // in progress, snap the feed to the live edge on arrival — never for
+  // finals, that's someone's replay position. pushMain: in the focus layout
+  // our own placements also swap the audible tile onto the main stage; user
+  // clicks never rearrange. force: the user's own click always wins over a
+  // stale content-side lock from an earlier click.
+  const promoted = await send(target.frameId, {
+    type: 'promote',
+    local: target.local,
+    goLive,
+    pushMain: source !== 'user',
+    force: source === 'user',
   });
-  await Promise.all(sends);
+  if (isRefusal(promoted)) return adoptRefusal(target.frameId, promoted);
+
+  const demotes = await Promise.all(
+    liveFrames(tabId, Date.now())
+      .filter((f) => f.frameId !== target.frameId)
+      .map((f) =>
+        send(f.frameId, { type: 'demote', force: source === 'user' }).then((r) => ({
+          frameId: f.frameId,
+          r,
+        }))
+      )
+  );
+  const refused = demotes.find(({ r }) => isRefusal(r));
+  if (refused) {
+    // Another frame is holding the pane the user clicked. Undo the promote so
+    // two frames don't play at once, then adopt the user's choice.
+    await send(target.frameId, { type: 'demote', force: true });
+    return adoptRefusal(refused.frameId, refused.r);
+  }
+
+  // The focus-layout swap moved the feed to a new pane index; follow it so
+  // the cursor keeps pointing at the game that carries the audio.
+  const swap = promoted && promoted.swap;
+  if (swap && swap.attempted) {
+    logEvent(tabId, 'push-main', {
+      ok: Boolean(swap.ok),
+      pane: target.label,
+      newLocal: swap.newLocal ?? null,
+    });
+  }
+  if (swap && swap.ok && Number.isInteger(swap.newLocal)) {
+    const landed = panes.findIndex(
+      (p) => p.frameId === target.frameId && p.local === swap.newLocal
+    );
+    if (landed >= 0) cursor.set(tabId, landed);
+  }
   return { ok: true, index, label: target.label };
 }
 
@@ -810,6 +919,7 @@ async function maybeTune(tabId, panes, settings, now) {
  */
 async function evaluate(tabId, { audioDead, blocked }) {
   const now = Date.now();
+  await stateReady;
   const settings = await currentSettings();
   const panes = paneList(tabId, now, settings);
   settlePendingTune(tabId, panes, now);
@@ -828,8 +938,10 @@ async function evaluate(tabId, { audioDead, blocked }) {
   const hold = manualHold.get(tabId);
   if (hold) {
     const held = panes.find((p) => p.key === hold.key);
-    if (!held) manualHold.delete(tabId);
-    else heldKey = hold.key;
+    if (!held) {
+      manualHold.delete(tabId);
+      persistSessionState();
+    } else heldKey = hold.key;
   }
 
   // Full pecking order: the user's click, then designated teams (unless being
@@ -856,8 +968,10 @@ async function evaluate(tabId, { audioDead, blocked }) {
 
     // Impatience: we JUST landed here. If this pane immediately shows a break
     // or dead air, the landing was bad — bail without waiting out the dwell,
-    // and heat the pane so the next escape avoids it.
-    const probing = sinceSwitch <= PROBE_MS;
+    // and heat the pane so the next escape avoids it. Only OUR landings probe:
+    // a pane the user placed is their judgement, not a landing to second-guess
+    // (the probe was ejecting user clicks within 2-5 seconds).
+    const probing = sinceSwitch <= PROBE_MS && placedBy.get(tabId) === 'extension';
     // Track commentary evidence for the audio pane: a fast clock for probe
     // bails, and a tolerant EMA for settled escapes.
     const heard = speech.get(tabId);
@@ -865,7 +979,13 @@ async function evaluate(tabId, { audioDead, blocked }) {
     if (!lastAlive.has(tabId)) lastAlive.set(tabId, now);
     if (listening && heard.speechPresent) {
       lastAlive.set(tabId, now);
-      if (current) feedSpeechEvidence(tabId, current, now);
+      if (current) {
+        feedSpeechEvidence(tabId, current, now);
+        // Confirmed speech clears the pane's silence-escape strikes: it is a
+        // real broadcast again, so future escapes restart at one ad pod.
+        const strikes = escapeStrikes.get(tabId);
+        if (strikes) strikes.delete(current.key);
+      }
     }
     const deadStreak = now - lastAlive.get(tabId);
     if (listening) {
@@ -891,8 +1011,16 @@ async function evaluate(tabId, { audioDead, blocked }) {
     const decision = Selector.choose({
       // The most important pane is exempt from cooling: when its ad genuinely
       // ends (the episode model guarantees that took ad-pod time), the audio
-      // returns without serving a second sentence.
-      panes: panes.map((p) => (p.key === topKey ? { ...p, cooling: false } : p)),
+      // returns without serving a second sentence. The user's HELD pane is
+      // additionally exempt from the "game is final" escape — a replay being
+      // watched by choice is never not-live enough to leave; only a break or
+      // dead air moves the audio off it.
+      panes: panes.map((p) => {
+        let q = p;
+        if (q.key === topKey) q = { ...q, cooling: false };
+        if (heldKey && q.key === heldKey) q = { ...q, notLive: false };
+        return q;
+      }),
       priorities,
       currentIndex: currentIndex(tabId, panes),
       // Dead air escapes come from OUR commentary-confidence EMA when we can
@@ -949,7 +1077,17 @@ async function evaluate(tabId, { audioDead, blocked }) {
           heatMap = new Map();
           paneHeat.set(tabId, heatMap);
         }
-        heatMap.set(departed.key, now + AUDIO_ESCAPE_HEAT_MS);
+        let strikes = escapeStrikes.get(tabId);
+        if (!strikes) {
+          strikes = new Map();
+          escapeStrikes.set(tabId, strikes);
+        }
+        const count = (strikes.get(departed.key) || 0) + 1;
+        strikes.set(departed.key, count);
+        heatMap.set(
+          departed.key,
+          now + Math.min(AUDIO_ESCAPE_HEAT_MS * 2 ** (count - 1), AUDIO_ESCAPE_HEAT_MAX_MS)
+        );
         feedBreakDetection(tabId, departed);
       }
       // A break-banner escape is also a confirmed break at a known position.
@@ -972,16 +1110,25 @@ async function rotate(tabId) {
   const from = currentIndex(tabId, panes);
   const to = (from + 1) % panes.length;
   // Explicit user action — hold the destination like a direct click.
-  manualHold.set(tabId, { key: panes[to].key });
+  setHold(tabId, panes[to].key);
   return promoteIndex(tabId, panes, to, { source: 'user' });
 }
 
 /** The user physically clicked a pane: adopt it, hold it, and reconcile every
  * frame's enforcement to it. No goLive snap — clicking to look at a pane is
  * not a request to lose your place in it. */
+/** tabId -> {at, frameId, local}: one physical click can surface twice
+ * (pointer replays across shadow boundaries); the echo must not re-run the
+ * heat/lean bookkeeping. */
+const lastUserSelect = new Map();
+
 async function userSelect(tabId, frameId, local) {
+  await stateReady;
   const settings = await currentSettings();
   const now = Date.now();
+  const prev = lastUserSelect.get(tabId);
+  if (prev && prev.frameId === frameId && prev.local === local && now - prev.at < 400) return;
+  lastUserSelect.set(tabId, { at: now, frameId, local });
   const panes = paneList(tabId, now, settings);
   const index = panes.findIndex((p) => p.frameId === frameId && p.local === local);
   if (index === -1) return;
@@ -1005,7 +1152,7 @@ async function userSelect(tabId, frameId, local) {
   // of desirability — refresh the hold and lock, teach nothing.
   if (abandoned) bump(clicked.affKey, CLICK_BOOST);
   if (abandoned && placedBy.get(tabId) === 'extension') bump(abandoned.affKey, -ABANDON_PENALTY);
-  userLockUntil.set(tabId, now + USER_LOCK_MS);
+  setUserLock(tabId, now + USER_LOCK_MS);
 
   // Clicking away = confirmed break on the abandoned pane. Toxic for the
   // length of an average ad pod, unconditionally.
@@ -1031,7 +1178,7 @@ async function userSelect(tabId, frameId, local) {
     panes: panes.map(snapPane),
   });
 
-  manualHold.set(tabId, { key: clicked.key });
+  setHold(tabId, clicked.key);
   await promoteIndex(tabId, panes, index, { goLive: false, source: 'user' });
 }
 
@@ -1160,6 +1307,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return respond(sendResponse, () => evaluate(tabId, msg));
     }
 
+    // The top frame's content script booted: a genuine refresh/navigation.
+    // Prerendered documents also boot at frameId 0 — resetting on those would
+    // wipe the session the user is actively watching, so only active
+    // documents count (the content script guards this too; belt and braces).
+    case 'pageBoot': {
+      if (tabId == null) return false;
+      if (sender.documentLifecycle && sender.documentLifecycle !== 'active') return false;
+      // Wait for persisted lock/hold hydration first: a freshly woken worker
+      // resetting before hydration would persist near-empty maps over every
+      // OTHER tab's surviving state.
+      if ((sender.frameId ?? 0) === 0) stateReady.then(() => softReset(tabId));
+      return false;
+    }
+
     // A real (isTrusted) click landed on a pane.
     case 'userSelect': {
       if (tabId == null) return false;
@@ -1283,10 +1444,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-// Soft reset on refresh/navigation: learned lean, holds, heat and break
-// episodes belong to the session that taught them.
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status !== 'loading') return;
+// Soft reset on a REAL page boot (the top frame's content script starting):
+// learned lean, holds, heat and break episodes belong to the session that
+// taught them. This used to hang off tabs.onUpdated's `loading` status, but
+// Chrome flips that on SUBFRAME navigations too — and MLB's player reloads
+// feed iframes constantly, so the reset fired mid-session and silently wiped
+// the user's hold, the user lock, and every pane's heat while they watched.
+// The flight recorder showed exactly that: locks and heat vanishing seconds
+// after being set, with the rest of the session state intact.
+function softReset(tabId) {
   paneAffinity.delete(tabId);
   placedBy.delete(tabId);
   manualHold.delete(tabId);
@@ -1298,9 +1464,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   alignments.delete(tabId);
   panePos.delete(tabId);
   userLockUntil.delete(tabId);
-});
+  escapeStrikes.delete(tabId);
+  persistSessionState();
+}
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await stateReady; // never persist over not-yet-hydrated state
   frames.delete(tabId);
   rails.delete(tabId);
   status.delete(tabId);
@@ -1317,5 +1486,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   lastTune.delete(tabId);
   tuneStrikes.delete(tabId);
   tuneTripped.delete(tabId);
+  escapeStrikes.delete(tabId);
+  userLockUntil.delete(tabId);
+  persistSessionState();
   if (speech.has(tabId)) stopListening(tabId);
 });
