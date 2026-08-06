@@ -1110,7 +1110,7 @@ async function rotate(tabId) {
   const from = currentIndex(tabId, panes);
   const to = (from + 1) % panes.length;
   // Explicit user action — hold the destination like a direct click.
-  manualHold.set(tabId, { key: panes[to].key });
+  setHold(tabId, panes[to].key);
   return promoteIndex(tabId, panes, to, { source: 'user' });
 }
 
@@ -1314,7 +1314,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'pageBoot': {
       if (tabId == null) return false;
       if (sender.documentLifecycle && sender.documentLifecycle !== 'active') return false;
-      if ((sender.frameId ?? 0) === 0) softReset(tabId);
+      // Wait for persisted lock/hold hydration first: a freshly woken worker
+      // resetting before hydration would persist near-empty maps over every
+      // OTHER tab's surviving state.
+      if ((sender.frameId ?? 0) === 0) stateReady.then(() => softReset(tabId));
       return false;
     }
 
@@ -1465,7 +1468,8 @@ function softReset(tabId) {
   persistSessionState();
 }
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await stateReady; // never persist over not-yet-hydrated state
   frames.delete(tabId);
   rails.delete(tabId);
   status.delete(tabId);
