@@ -3,14 +3,14 @@
  *
  * Non-top frames just report the panes they can see and carry out promote /
  * demote orders. The top frame additionally acts as coordinator: it owns the
- * clock, runs the silence machine, and asks the worker to rotate.
+ * clock and asks the worker to re-evaluate which pane should have the audio.
  *
  * The clock lives here rather than in the service worker because MV3 workers
  * are torn down after ~30s idle, which no amount of alarms fixes at the 300ms
  * resolution this needs.
  */
 (() => {
-  const { PHASES, initialState, step } = globalThis.MLBSilenceMachine;
+  const { initialState, step } = globalThis.MLBSilenceMachine;
   const Settings = globalThis.MLBSettings;
 
   const TICK_MS = 300;
@@ -21,6 +21,8 @@
   // How long to let MLB's own click handling settle before we assert the audio
   // state ourselves.
   const SETTLE_MS = 350;
+  // Break banners are short and sit near the top of the pane's text.
+  const TEXT_SCAN_LIMIT = 400;
 
   const isCoordinator = window.top === window.self;
 
@@ -49,6 +51,10 @@
    * the same box. That element is the clickable "pane" as far as the page is
    * concerned — the video is usually wrapped in a couple of positioning divs
    * plus an overlay that swallows clicks.
+   *
+   * Hard stop at any ancestor holding a second <video>: crossing that boundary
+   * means we have grabbed the whole multiview grid, and one game's break banner
+   * would then appear to belong to every pane.
    */
   function findPaneContainer(video) {
     const videoArea = area(video.getBoundingClientRect());
@@ -56,35 +62,116 @@
     let best = video;
     let node = video.parentElement;
     while (node && node !== document.body) {
-      if (area(node.getBoundingClientRect()) > videoArea * 1.8) break;
+      if (node.querySelectorAll('video').length > 1) break;
+      if (area(node.getBoundingClientRect()) > videoArea * 1.6) break;
       best = node;
       node = node.parentElement;
     }
     return best;
   }
 
+  function paneText(container) {
+    const text = container.innerText || container.textContent || '';
+    return text.slice(0, TEXT_SCAN_LIMIT);
+  }
+
+  function breakPattern() {
+    try {
+      return new RegExp(settings.breakText || Settings.DEFAULTS.breakText, 'i');
+    } catch {
+      return new RegExp(Settings.DEFAULTS.breakText, 'i');
+    }
+  }
+
+  /**
+   * A stable-ish identity for the game in this pane, so priorities survive a
+   * switch between 2/3/4-game layouts (where display position changes but the
+   * game does not). Falls back to position when the page gives us nothing.
+   */
+  function derivePaneKey(container, index) {
+    const idHolder =
+      container.querySelector('[data-game-pk],[data-gamepk],[data-game-id]') ||
+      container.closest('[data-game-pk],[data-gamepk],[data-game-id]');
+    if (idHolder) {
+      const id =
+        idHolder.getAttribute('data-game-pk') ||
+        idHolder.getAttribute('data-gamepk') ||
+        idHolder.getAttribute('data-game-id');
+      if (id) return { key: `game:${id}`, label: `Game ${id}` };
+    }
+
+    // Team logos carry alt text; two of them make a recognisable matchup.
+    const alts = [...container.querySelectorAll('img[alt]')]
+      .map((img) => img.alt.trim())
+      .filter((alt) => alt && alt.length < 40);
+    if (alts.length >= 2) {
+      const matchup = `${alts[0]} v ${alts[1]}`;
+      return { key: `teams:${matchup.toLowerCase()}`, label: matchup };
+    }
+
+    const link = container.querySelector('a[href*="gamePk="], a[href*="/gameday/"]');
+    if (link) return { key: `href:${link.getAttribute('href')}`, label: link.textContent.trim() || 'Game' };
+
+    return { key: `pos:${index}`, label: `Pane ${index + 1}` };
+  }
+
+  /** MLB outlines the active pane; class names are the cheapest way to spot it. */
+  const ACTIVE_CLASS = /(^|[-_ ])(active|selected|primary|focused)([-_ ]|$)/i;
+
+  function looksActive(container) {
+    let node = container;
+    for (let depth = 0; node && depth < 3; depth++, node = node.parentElement) {
+      const className = typeof node.className === 'string' ? node.className : '';
+      if (ACTIVE_CLASS.test(className)) return true;
+      if (node.getAttribute && node.getAttribute('aria-current')) return true;
+    }
+    return false;
+  }
+
   function discoverPanes() {
+    let containers;
     if (settings.paneSelector) {
       try {
-        return [...document.querySelectorAll(settings.paneSelector)]
+        containers = [...document.querySelectorAll(settings.paneSelector)]
           .map((container) => ({ container, video: container.querySelector('video') }))
           .filter((p) => p.video);
       } catch {
-        // Bad selector in options; fall through to the heuristic.
+        containers = null; // Bad selector in options; fall through to the heuristic.
       }
     }
-    return [...document.querySelectorAll('video')]
-      .filter((v) => {
-        const r = v.getBoundingClientRect();
-        return r.width >= MIN_PANE_WIDTH && r.height >= MIN_PANE_HEIGHT;
-      })
-      .map((video) => ({ video, container: findPaneContainer(video) }));
+    if (!containers) {
+      containers = [...document.querySelectorAll('video')]
+        .filter((v) => {
+          const r = v.getBoundingClientRect();
+          return r.width >= MIN_PANE_WIDTH && r.height >= MIN_PANE_HEIGHT;
+        })
+        .map((video) => ({ video, container: findPaneContainer(video) }));
+    }
+
+    const pattern = breakPattern();
+    return containers.map((pane, index) => {
+      const { key, label } = derivePaneKey(pane.container, index);
+      return {
+        ...pane,
+        key,
+        label,
+        inBreak: pattern.test(paneText(pane.container)),
+        active: looksActive(pane.container),
+      };
+    });
   }
 
-  /** Index of the pane currently carrying audio, or null. */
+  /**
+   * Which pane holds the audio. The media flags are authoritative when they say
+   * something useful; the page's own active styling is the tiebreaker, since
+   * MLB re-asserts its mute state after our clicks and can briefly leave every
+   * element muted.
+   */
   function primaryIndex(panes) {
-    const i = panes.findIndex((p) => !p.video.muted && p.video.volume > 0);
-    return i === -1 ? null : i;
+    const byAudio = panes.findIndex((p) => !p.video.muted && p.video.volume > 0);
+    if (byAudio !== -1) return byAudio;
+    const byClass = panes.findIndex((p) => p.active);
+    return byClass === -1 ? null : byClass;
   }
 
   // ------------------------------------------------------------ promotion
@@ -158,8 +245,8 @@
     const after = discoverPanes();
     if (after.length) applyAudio(after, Math.min(local, after.length - 1));
 
-    lastAction = `promoted pane ${local + 1}/${after.length || panes.length}`;
-    return { ok: true };
+    lastAction = `promoted ${pane.label}`;
+    return { ok: true, label: pane.label };
   }
 
   function demote() {
@@ -197,20 +284,31 @@
       });
       document.documentElement.appendChild(hud);
     }
-    hud.textContent = [
+
+    const panes = discoverPanes();
+    const lines = [
       `phase    ${machine.phase}`,
+      `signal   ${info.source}${info.listening ? ` ${info.recentDb}dB / floor ${info.floorDb}dB` : ''}`,
       `audible  ${info.audible}`,
       `panes    ${info.totalPanes}`,
-      `attempts ${machine.attempts}`,
-      `last     ${lastAction}`,
-    ].join('\n');
+    ];
+    panes.forEach((p, i) => {
+      const marks = [p.inBreak ? 'BREAK' : 'live', p.video.muted ? '' : 'audio'].filter(Boolean);
+      lines.push(`  ${i + 1}. ${p.label} [${marks.join(' ')}]`);
+    });
+    lines.push(`last     ${lastAction}`);
+    hud.textContent = lines.join('\n');
   }
 
   // ---------------------------------------------------------------- loops
 
   async function report() {
     const panes = discoverPanes();
-    await toWorker({ type: 'report', paneCount: panes.length, primaryLocal: primaryIndex(panes) });
+    await toWorker({
+      type: 'report',
+      panes: panes.map((p) => ({ key: p.key, label: p.label, inBreak: p.inBreak })),
+      primaryLocal: primaryIndex(panes),
+    });
   }
 
   async function tick() {
@@ -233,9 +331,16 @@
       });
       machine = out.state;
 
-      if (out.action) {
-        lastAction = `switch requested @ ${new Date().toLocaleTimeString()}`;
-        await toWorker({ type: 'requestSwitch' });
+      // The worker decides *where* to go; the machine only decides *when* the
+      // audio has been dead long enough to count. Break banners are evaluated
+      // worker-side on every tick, so a break moves us without waiting.
+      const result = await toWorker({
+        type: 'evaluate',
+        audioDead: Boolean(out.action),
+        blocked,
+      });
+      if (result && result.switched) {
+        lastAction = `${result.reason} -> ${result.label || `pane ${result.index + 1}`}`;
       }
       renderHud(state);
     } finally {

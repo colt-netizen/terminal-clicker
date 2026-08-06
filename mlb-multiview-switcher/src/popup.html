@@ -5,8 +5,15 @@
     <title>MLB Multiview Audio Switcher</title>
     <link rel="stylesheet" href="ui.css" />
   </head>
-  <body style="width: 260px">
+  <body style="width: 300px">
     <div class="status" id="status">reading tab…</div>
+
+    <h1>Priority</h1>
+    <p class="hint" style="margin: -6px 0 8px">
+      Top of the list wins. When your favourite goes to a commercial break the audio drops to the
+      next one down, then comes back up when the break ends.
+    </p>
+    <ul class="panes" id="panes"></ul>
 
     <div class="row">
       <label for="enabled">Enabled</label>
@@ -14,16 +21,20 @@
     </div>
 
     <div class="row">
+      <label for="listenMode">
+        Listen for dead air
+        <span class="hint">Analyses tab audio to catch quiet stretches with no break banner.</span>
+      </label>
+      <input type="checkbox" id="listenMode" />
+    </div>
+
+    <div class="row">
       <button id="switchNow" type="button">Switch now</button>
       <button id="openOptions" type="button">Settings</button>
     </div>
 
-    <p class="note">
-      “Switch now” rotates to the next pane immediately — the quickest way to confirm promotion
-      works on your layout without waiting for dead air.
-    </p>
-
     <script src="shared/settings.js"></script>
+    <script src="shared/pane-selector.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

@@ -1,8 +1,8 @@
 const Settings = globalThis.MLBSettings;
 
 const CHECKBOXES = ['enabled', 'respectTabMute', 'debugOverlay'];
-const NUMBERS = ['silenceThresholdMs', 'graceMs', 'backoffMs'];
-const TEXTS = ['paneSelector'];
+const NUMBERS = ['silenceThresholdMs', 'graceMs', 'backoffMs', 'speechMarginDb'];
+const TEXTS = ['paneSelector', 'breakText'];
 
 const $ = (id) => document.getElementById(id);
 

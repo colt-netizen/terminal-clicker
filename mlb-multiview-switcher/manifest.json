@@ -3,7 +3,7 @@
   "name": "MLB Multiview Audio Switcher",
   "version": "0.1.0",
   "description": "When the audio pane in an MLB.tv multiview goes quiet, promote another pane until sound comes back.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "tabCapture", "offscreen"],
   "host_permissions": ["*://*.mlb.com/*"],
   "background": {
     "service_worker": "src/background.js"
@@ -11,7 +11,12 @@
   "content_scripts": [
     {
       "matches": ["*://*.mlb.com/*"],
-      "js": ["src/shared/silence-machine.js", "src/shared/settings.js", "src/content.js"],
+      "js": [
+        "src/shared/silence-machine.js",
+        "src/shared/pane-selector.js",
+        "src/shared/settings.js",
+        "src/content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": true
     }

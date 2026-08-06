@@ -104,6 +104,64 @@ button:hover {
   font-size: 11px;
 }
 
+.panes {
+  list-style: none;
+  margin: 0 0 6px;
+  padding: 0;
+}
+
+.panes li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.panes li.empty {
+  color: var(--muted);
+  border-bottom: 0;
+}
+
+.pane-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-name.offscreen {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.tag {
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--line);
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tag.on {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+button.move {
+  padding: 2px 7px;
+  line-height: 1.2;
+}
+
+button.move:disabled {
+  opacity: 0.3;
+  cursor: default;
+  border-color: var(--line);
+  color: var(--fg);
+}
+
 .saved {
   color: var(--accent);
   font-size: 11px;

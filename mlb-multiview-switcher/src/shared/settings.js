@@ -19,6 +19,17 @@
     // CSS selector for pane containers. Empty means "infer from the video
     // elements", which is what you want unless the heuristic misfires.
     paneSelector: '',
+    // Matched (case-insensitively) against each pane's text. MLB renders
+    // "Commercial Break in Progress" over the paused game, which is a far more
+    // reliable break signal than anything we can infer from the audio.
+    breakText: 'commercial break',
+    // Pane keys, best first. Managed from the popup.
+    priorities: [],
+    // Analyse captured tab audio to notice when commentary stops even without a
+    // break banner. Costs a tabCapture permission prompt, so it is opt-in.
+    listenMode: false,
+    // How far above the ambient floor commentary has to sit, in dB.
+    speechMarginDb: 7,
     // Leave the page alone while the user has the tab explicitly muted.
     respectTabMute: true,
     debugOverlay: false,
@@ -28,6 +39,7 @@
     silenceThresholdMs: [500, 60000],
     graceMs: [500, 60000],
     backoffMs: [0, 600000],
+    speechMarginDb: [1, 40],
   };
 
   function clampNumbers(values) {
@@ -44,8 +56,14 @@
     return clampNumbers({ ...DEFAULTS, ...stored });
   }
 
+  /**
+   * Merges over what is *stored*, not over DEFAULTS — the options page only
+   * knows about its own fields, and merging over defaults would silently reset
+   * everything it does not render (the priority list, most importantly).
+   */
   async function save(patch) {
-    await chrome.storage.sync.set(clampNumbers({ ...DEFAULTS, ...patch }));
+    const current = await load();
+    await chrome.storage.sync.set(clampNumbers({ ...current, ...patch }));
   }
 
   /** Fires `handler(settings)` whenever any setting changes. */

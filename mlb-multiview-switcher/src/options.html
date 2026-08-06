@@ -54,6 +54,28 @@
     </div>
 
     <div class="row" style="display: block">
+      <label for="breakText">
+        Commercial break text
+        <span class="hint">
+          Case-insensitive pattern matched against each pane's on-screen text. MLB renders
+          “Commercial Break in Progress” over the paused game — this is the primary break signal.
+        </span>
+      </label>
+      <input type="text" id="breakText" placeholder="commercial break" />
+    </div>
+
+    <div class="row">
+      <label for="speechMarginDb">
+        Speech margin (dB)
+        <span class="hint">
+          Listen-mode only. How far above the ambient bed commentary must sit. Raise it if crowd
+          noise reads as talking; lower it if quiet commentary is missed.
+        </span>
+      </label>
+      <input type="number" id="speechMarginDb" min="1" max="40" step="1" />
+    </div>
+
+    <div class="row" style="display: block">
       <label for="paneSelector">
         Pane selector (advanced)
         <span class="hint">

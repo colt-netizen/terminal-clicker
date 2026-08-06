@@ -14,7 +14,30 @@ Arc and anything else Chromium-based will load it the same way.
 2. **Load unpacked** → select this `mlb-multiview-switcher/` directory.
 3. Open an MLB.tv multiview tab. Click the extension icon to see live status.
 
+## How it decides where the audio should go
+
+MLB renders a literal **“Commercial Break in Progress”** banner into whichever
+pane is on a break. That is a per-pane, unambiguous fact — far better than
+anything inferable from the audio — so it is the primary signal.
+
+Combined with your priority order, the rule is simply:
+
+> Put the audio on the highest-priority game that is **not** on a commercial break.
+
+Return-to-favourite falls out of that for free: when your top game comes back
+from its break it outranks whatever you fell back to, so the next evaluation
+moves back on its own. Priorities are keyed by *game*, not by screen position,
+so they survive switching between 2-, 3- and 4-game layouts.
+
+Set the order in the popup with the ↑/↓ buttons. Games you've ranked before stay
+in the list even when they aren't on screen, so they keep their slot.
+
+If every pane is on a break at once, it holds — trading one break for another
+achieves nothing.
+
 ## How it decides "audio isn't playing"
+
+This is the secondary signal, for dead air that carries no break banner.
 
 The obvious approach — wire the `<video>` into a Web Audio `AnalyserNode` and
 measure loudness — is **not usable here**, for two reasons:
@@ -31,31 +54,28 @@ derives below the DRM boundary and exposes for free. Multiview keeps every
 non-primary pane muted, which makes "the tab is audible" equivalent to "the
 primary pane is making noise" — exactly the signal we want.
 
-**The trade-off:** `audible` is a boolean, not a level, and Chrome applies about
-2 seconds of its own hysteresis before flipping it to `false`. With the default
-3s threshold the real-world delay is therefore closer to **5 seconds**. Lower
-the threshold in Settings if you want it snappier; there is no way to claw back
-Chrome's 2s.
+**The catch:** `audible` is a boolean, not a level. A commercial break is *not
+silent* — stadium echo, crowd murmur and PA bleed keep the tab "audible" the
+whole way through, so this flag alone never notices a break. That is exactly why
+the banner above is the primary signal.
 
-## How it decides where to go
+### Listen mode (optional)
 
-It can't know in advance which other game has audio — every non-primary pane is
-muted, so they all look silent. Rather than guess, it **rotates**: promote the
-next pane, wait out the grace period, and if that one is quiet too, rotate
-again. Since audio returning resets everything, the rotation naturally settles
-on whichever game is actually live.
+For dead air with no banner, turn on **Listen for dead air** in the popup. It
+captures the tab's audio (via `chrome.tabCapture`, which works on protected
+streams and never touches the page's media elements) and decides whether anyone
+is actually *talking*.
 
-If it laps every pane without finding sound, the whole multiview is quiet
-(between innings, say) and it backs off for 20s instead of churning.
+It doesn't use an absolute threshold, because the ambient bed differs per
+stadium and per moment. Instead it tracks a noise floor that falls fast and
+rises slowly, then calls it commentary when speech-band energy (300–3400Hz) sits
+`speechMarginDb` above that floor. Steady crowd noise and walk-up music get
+absorbed into the floor within seconds and stop counting; the gaps between words
+keep the floor down during real commentary.
 
-State machine, with defaults:
-
-```
-watching ──silent 3s──> switch ──> grace 4s ──> silent 3s ──> switch ──> …
-    ^                                                              │
-    └────────────── audio returns (resets attempts) ───────────────┘
-                    a full lap with no audio ──> backoff 20s
-```
+Capturing a tab mutes it unless the stream is played back, so the audio graph
+forks — one branch to the analyser, one straight to your speakers. Any error
+tears the capture down, which restores normal audio.
 
 ## Promoting a pane
 
@@ -105,11 +125,18 @@ Turn on the **debug overlay** and read `panes`:
 ## Tests
 
 ```bash
-node --test tests/silence-machine.test.cjs
+for f in tests/*.cjs; do node --test "$f"; done
 ```
 
-13 tests over the timing logic (thresholds, grace suppression, lap detection,
-backoff, attempt reset, the disabled/single-pane no-ops, purity).
+43 tests over the three pure modules:
+
+- **pane-selector** (17) — priority order, leaving a break, return-to-favourite,
+  holding when everything is on a break, 2/3/4-game mode transitions.
+- **silence-machine** (13) — thresholds, grace suppression, backoff, attempt
+  reset, the disabled/single-pane no-ops, purity.
+- **speech-detector** (13) — steady crowd noise and music rejected, commentary
+  detected over a loud bed, the quiet-echoey-break case, transient rejection,
+  floor asymmetry.
 
 **What is not covered:** everything that touches the live site — pane discovery,
 container detection, and the click strategies. MLB.tv is behind a paid login and
