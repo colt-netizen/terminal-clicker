@@ -296,6 +296,28 @@ async function setListenMode(on) {
 
   $('openOptions').addEventListener('click', () => chrome.runtime.openOptionsPage());
 
+  $('copyLog').addEventListener('click', async () => {
+    const result = await send({ type: 'getLog' });
+    const log = (result && result.log) || [];
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(log, null, 1));
+      $('copyLog').textContent = `Copied ${log.length} events`;
+    } catch {
+      $('copyLog').textContent = 'Copy failed';
+    }
+    setTimeout(() => {
+      $('copyLog').textContent = 'Copy debug log';
+    }, 1800);
+  });
+
+  $('clearLog').addEventListener('click', async () => {
+    await send({ type: 'clearLog' });
+    $('clearLog').textContent = 'Cleared';
+    setTimeout(() => {
+      $('clearLog').textContent = 'Clear log';
+    }, 1200);
+  });
+
   refresh();
   setInterval(refresh, 1000);
 })();

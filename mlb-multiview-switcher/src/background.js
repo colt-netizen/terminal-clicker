@@ -142,6 +142,54 @@ const paneHeat = new Map();
 /** tabId -> timestamp of the last promotion. */
 const lastSwitch = new Map();
 
+// ------------------------------------------------------------- decision log
+//
+// A flight recorder for every decision: what was known about each pane, the
+// audio evidence, the priorities, the stated reason. User clicks are logged
+// as corrections with how long after our placement they arrived. Persisted to
+// storage.local (survives worker and browser restarts), exported from the
+// popup so the user can hand over real data instead of recollections.
+
+const LOG_CAP = 400;
+let decisionLog = [];
+let logLoaded = false;
+async function ensureLog() {
+  if (logLoaded) return;
+  logLoaded = true;
+  try {
+    const d = await chrome.storage.local.get('decisionLog');
+    if (Array.isArray(d.decisionLog)) decisionLog = d.decisionLog;
+  } catch {
+    // storage unavailable; keep the in-memory log
+  }
+}
+let logSaveTimer = null;
+function logEvent(tabId, type, data) {
+  const entry = { t: new Date().toISOString(), tab: tabId, type, ...data };
+  decisionLog.push(entry);
+  if (decisionLog.length > LOG_CAP) decisionLog = decisionLog.slice(-LOG_CAP);
+  if (logSaveTimer) clearTimeout(logSaveTimer);
+  logSaveTimer = setTimeout(() => {
+    chrome.storage.local.set({ decisionLog }).catch(() => {});
+  }, 1500);
+}
+function snapPane(p) {
+  return {
+    key: p.key,
+    label: p.label,
+    state: p.stateText || p.kind || '?',
+    live: p.live,
+    brk: p.inBreak,
+    cool: p.cooling,
+    heat: p.heated,
+    paused: p.paused,
+    lean: Math.round((p.affinity || 0) * 10) / 10,
+    rank: p.teamRank === Number.MAX_SAFE_INTEGER ? null : p.teamRank,
+    int: Math.round(p.interest || 0),
+  };
+}
+ensureLog();
+
 // ------------------------------------------------------------ settings cache
 
 /**
@@ -488,10 +536,12 @@ function settlePendingTune(tabId, panes, now) {
   if (panes.some((p) => p.gamePk === pending.gamePk)) {
     pendingTune.delete(tabId);
     tuneStrikes.delete(tabId);
+    logEvent(tabId, 'tune-ok', { gamePk: pending.gamePk });
     return;
   }
   if (now - pending.sentAt > TUNE_VERIFY_MS) {
     pendingTune.delete(tabId);
+    logEvent(tabId, 'tune-fail', { gamePk: pending.gamePk });
     tuneFailures.set(pending.gamePk, now + TUNE_FAILURE_BAN_MS);
     const strikes = (tuneStrikes.get(tabId) || 0) + 1;
     tuneStrikes.set(tabId, strikes);
@@ -562,6 +612,12 @@ async function maybeTune(tabId, panes, settings, now) {
 
   pendingTune.set(tabId, { gamePk: target.gamePk, sentAt: now });
   lastTune.set(tabId, now);
+  logEvent(tabId, 'tune-attempt', {
+    gamePk: target.gamePk,
+    card: cards[target.cardIndex] ? cards[target.cardIndex].text : null,
+    replaceIndex: target.replaceIndex,
+    replayMode,
+  });
 
   const give = panes[target.replaceIndex];
   const card = cards[target.cardIndex];
@@ -693,6 +749,25 @@ async function evaluate(tabId, { audioDead, blocked }) {
       const departed = current;
       const result = await promoteIndex(tabId, panes, decision.index);
       switched = { switched: result.ok, ...result, reason: decision.reason };
+      logEvent(tabId, 'switch', {
+        reason: decision.reason,
+        ok: result.ok,
+        from: departed ? snapPane(departed) : null,
+        to: panes[decision.index] ? snapPane(panes[decision.index]) : null,
+        signal: {
+          listening,
+          conf: Math.round(confidence * 100) / 100,
+          spreadDb: heard ? heard.spreadDb : null,
+          recentDb: heard ? heard.recentDb : null,
+          deadStreakMs: deadStreak,
+          sinceSwitchMs: sinceSwitch,
+          badLanding,
+          machineAudioDead: audioDead,
+        },
+        priorities,
+        replayMode: isReplayContext(scheduleGames()),
+        panes: panes.map(snapPane),
+      });
       // Escaped for silence: the departed pane is suspected to be running an
       // in-stream slate. Heat it for the rest of the pod so the return rule
       // cannot boomerang the audio straight back into it.
@@ -751,6 +826,16 @@ async function userSelect(tabId, frameId, local) {
   const curIdx = currentIndex(tabId, panes);
   const abandoned = curIdx >= 0 && curIdx !== index ? panes[curIdx] : null;
   if (abandoned && placedBy.get(tabId) === 'extension') bump(abandoned.affKey, -ABANDON_PENALTY);
+
+  logEvent(tabId, 'click-correction', {
+    clicked: snapPane(clicked),
+    abandoned: abandoned ? snapPane(abandoned) : null,
+    placedBy: placedBy.get(tabId) || null,
+    // How long after our placement the user overrode it: the "too slow or
+    // wrong" measurement.
+    sincePlacedMs: now - (lastSwitch.get(tabId) || now),
+    panes: panes.map(snapPane),
+  });
 
   manualHold.set(tabId, { key: clicked.key });
   await promoteIndex(tabId, panes, index, { goLive: false, source: 'user' });
@@ -953,6 +1038,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'stopListening': {
       return respond(sendResponse, () => stopListening(msg.tabId));
+    }
+
+    case 'getLog': {
+      return respond(sendResponse, async () => {
+        await ensureLog();
+        return { log: decisionLog };
+      });
+    }
+
+    case 'clearLog': {
+      return respond(sendResponse, async () => {
+        decisionLog = [];
+        await chrome.storage.local.set({ decisionLog: [] }).catch(() => {});
+        return { ok: true };
+      });
     }
 
     case 'popupStatus': {
