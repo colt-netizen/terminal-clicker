@@ -35,9 +35,14 @@
    * @param {string[]} input.priorities     pane keys, best first
    * @param {number} input.currentIndex     pane carrying audio now, -1 if unknown
    * @param {boolean} input.audioDead       silence machine says nothing is playing
+   * @param {boolean} [input.allowUpgrade]  default true; when false, a merely
+   *   *better* pane cannot steal audio from a current pane that is playing
+   *   fine — only escapes (break, dead game, dead air) may move it. The caller
+   *   passes false while freshly settled, so landing on a game means hearing
+   *   that game, not five seconds of it.
    * @returns {{index: number, reason: string} | null}  null means stay put
    */
-  function choose({ panes, priorities, currentIndex, audioDead }) {
+  function choose({ panes, priorities, currentIndex, audioDead, allowUpgrade }) {
     if (!panes || panes.length < 2) return null;
 
     const ranked = panes.map((pane, index) => ({
@@ -81,7 +86,9 @@
     if (current.notLive && liveAvailable.length) {
       return { index: other.index, reason: current.notLiveReason || 'current pane is not live baseball' };
     }
-    if (other.rank < current.rank) return { index: other.index, reason: 'a higher-priority game is available' };
+    if (other.rank < current.rank && allowUpgrade !== false) {
+      return { index: other.index, reason: 'a higher-priority game is available' };
+    }
     if (audioDead) return { index: other.index, reason: 'no audio on the current pane' };
 
     return null;

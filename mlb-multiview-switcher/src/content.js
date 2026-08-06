@@ -378,6 +378,45 @@
       if (video.muted !== shouldMute) video.muted = shouldMute;
       if (!shouldMute && video.volume === 0) video.volume = 1;
     });
+    positionAudioRing(videos);
+  }
+
+  /**
+   * The green ring: OUR marker for which pane is carrying the audio. MLB's
+   * white outline tracks its own focus state, which we neither control nor
+   * trust — without this the user cannot tell which game they are hearing.
+   */
+  let audioRing = null;
+
+  function positionAudioRing(videos) {
+    const video = desired !== undefined && desired !== -1 && settings.enabled ? videos[desired] : null;
+    if (!video) {
+      if (audioRing) {
+        audioRing.remove();
+        audioRing = null;
+      }
+      return;
+    }
+    if (!audioRing) {
+      audioRing = document.createElement('div');
+      audioRing.id = 'mlb-multiview-switcher-audio-ring';
+      Object.assign(audioRing.style, {
+        position: 'fixed',
+        zIndex: '2147483646',
+        border: '3px solid #21d07a',
+        borderRadius: '4px',
+        boxShadow: '0 0 10px rgba(33, 208, 122, .7)',
+        pointerEvents: 'none',
+      });
+      document.documentElement.appendChild(audioRing);
+    }
+    const r = video.getBoundingClientRect();
+    Object.assign(audioRing.style, {
+      left: `${r.left - 3}px`,
+      top: `${r.top - 3}px`,
+      width: `${r.width}px`,
+      height: `${r.height}px`,
+    });
   }
 
   /** Jump a live feed to its live edge (a few seconds back from the boundary

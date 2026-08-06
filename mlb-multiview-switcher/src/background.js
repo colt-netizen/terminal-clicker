@@ -64,6 +64,16 @@ const SWITCH_COOLDOWN_MS = 2500;
  * game rather than a slideshow of stuttering samples when detection misfires.
  */
 const AUDIO_DWELL_MS = 20000;
+/**
+ * A break only counts as over after the banner has been GONE this long.
+ * Overlay detection can flicker as the page re-renders; without stickiness,
+ * one missed scan reads as "break ended", the return rule fires, and the
+ * audio dives straight back into the commercial.
+ */
+const BREAK_CLEAR_MS = 6000;
+
+/** tabId -> Map<paneKey, when the break banner was last seen>. */
+const breakSeen = new Map();
 
 /** tabId -> timestamp of the last promotion. */
 const lastSwitch = new Map();
@@ -218,6 +228,12 @@ function paneList(tabId, now, teamPriorities) {
     games.length > 0 &&
     !games.some((g) => ['live', 'paused'].includes(Intel.classifyApiGame(g)));
 
+  let seen = breakSeen.get(tabId);
+  if (!seen) {
+    seen = new Map();
+    breakSeen.set(tabId, seen);
+  }
+
   const out = [];
   for (const frame of liveFrames(tabId, now)) {
     (frame.panes || []).forEach((pane, local) => {
@@ -226,6 +242,13 @@ function paneList(tabId, now, teamPriorities) {
         Intel.matchByKey(games, pane.key) ||
         Intel.matchGame(games, tokens) ||
         Intel.matchGameByText(games, pane.text);
+
+      // Sticky break: entering is immediate, leaving requires the banner to
+      // stay gone for BREAK_CLEAR_MS.
+      if (pane.inBreak) seen.set(pane.key, now);
+      const inBreak =
+        Boolean(pane.inBreak) || (seen.has(pane.key) && now - seen.get(pane.key) < BREAK_CLEAR_MS);
+      pane = { ...pane, inBreak };
 
       let railState = null;
       if (!game && tokens.length) {
@@ -512,6 +535,12 @@ async function evaluate(tabId, { audioDead, blocked }) {
       // Dead air may only move the audio once per dwell window; definite
       // signals (breaks, dead games) keep the ordinary cooldown.
       audioDead: audioDead && sinceSwitch >= AUDIO_DWELL_MS,
+      // Never. The tool exists to escape ad breaks and dead games, not to
+      // "improve" on a game that is being played. While the current pane is
+      // showing baseball, nothing outranks it — priorities only pick where an
+      // escape lands. The user moves the audio by clicking; we move it only
+      // when their game stops.
+      allowUpgrade: false,
     });
     if (decision) {
       const result = await promoteIndex(tabId, panes, decision.index);

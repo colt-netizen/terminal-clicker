@@ -291,3 +291,47 @@ test('a break falls back to a between-innings pane when nothing is mid-action', 
   });
   assert.strictEqual(result.index, 1);
 });
+
+// --- escape-only: upgrades never steal from a playing game ---
+
+test('a playing pane keeps audio even when a higher-priority pane is available', () => {
+  const result = choose({
+    panes: [pane('fav'), pane('other')],
+    priorities: ['fav', 'other'],
+    currentIndex: 1,
+    audioDead: false,
+    allowUpgrade: false,
+  });
+  assert.strictEqual(result, null, 'no bopping around while the current game plays');
+});
+
+test('escapes still fire with upgrades disabled', () => {
+  const fromBreak = choose({
+    panes: [pane('a', true), pane('b')],
+    priorities: ['a', 'b'],
+    currentIndex: 0,
+    audioDead: false,
+    allowUpgrade: false,
+  });
+  assert.strictEqual(fromBreak.index, 1, 'leaving a break is an escape, not an upgrade');
+
+  const fromDead = choose({
+    panes: [{ key: 'a', notLive: true, notLiveReason: 'game is final' }, pane('b')],
+    priorities: ['a', 'b'],
+    currentIndex: 0,
+    audioDead: false,
+    allowUpgrade: false,
+  });
+  assert.strictEqual(fromDead.index, 1, 'leaving a dead game is an escape');
+});
+
+test('escapes land on the highest-priority watchable pane', () => {
+  const result = choose({
+    panes: [pane('a', true), pane('b'), pane('fav')],
+    priorities: ['fav', 'a', 'b'],
+    currentIndex: 0,
+    audioDead: false,
+    allowUpgrade: false,
+  });
+  assert.strictEqual(result.index, 2, 'priorities pick the destination, never cause a move');
+});
