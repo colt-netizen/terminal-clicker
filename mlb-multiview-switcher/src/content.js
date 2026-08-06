@@ -360,6 +360,15 @@
    */
   let desired;
 
+  // The user's click is enforced HERE, not just in the worker. The worker's
+  // lock/hold state is in-memory and has been lost mid-session more than once
+  // (worker restarts, spurious page-boot resets) — and every loss showed up as
+  // the audio being yanked seconds after a click. The content script is the
+  // one place that reliably saw the click, so for a minute afterwards it
+  // refuses any instruction that contradicts it.
+  const USER_LOCK_LOCAL_MS = 60000;
+  let userLockUntilLocal = 0;
+
   /** The bare video elements, without the text/identity work — cheap enough
    * to call several times a second from the enforcement loop. */
   function paneVideos() {
@@ -698,10 +707,31 @@
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'promote') {
+      if (
+        !msg.force &&
+        Date.now() < userLockUntilLocal &&
+        desired !== undefined &&
+        desired !== -1 &&
+        msg.local !== desired
+      ) {
+        sendResponse({ ok: false, reason: 'user lock', local: desired });
+        return false;
+      }
+      if (msg.force) userLockUntilLocal = 0; // a NEWER user click supersedes
       promote(msg.local, msg.goLive, msg.pushMain).then(sendResponse);
       return true;
     }
     if (msg.type === 'demote') {
+      if (
+        !msg.force &&
+        Date.now() < userLockUntilLocal &&
+        desired !== undefined &&
+        desired !== -1
+      ) {
+        sendResponse({ ok: false, reason: 'user lock', local: desired });
+        return false;
+      }
+      if (msg.force) userLockUntilLocal = 0;
       sendResponse(demote());
       return false;
     }
@@ -738,7 +768,16 @@
     // status is useless for this — MLB's feed iframes reload constantly and
     // flip it mid-session, which silently wiped holds, locks, heat and
     // learning while the user watched.
-    if (isCoordinator) toWorker({ type: 'pageBoot' });
+    // Prerendered documents also run content scripts at frameId 0 — announcing
+    // from one would soft-reset the session the user is actively watching.
+    if (isCoordinator) {
+      const announce = () => toWorker({ type: 'pageBoot' });
+      if (document.prerendering) {
+        document.addEventListener('prerenderingchange', announce, { once: true });
+      } else {
+        announce();
+      }
+    }
 
     // A real user click on a pane is the strongest signal there is: adopt it
     // as the enforced audio target immediately (before the worker even hears
@@ -752,6 +791,7 @@
         const index = panes.findIndex((p) => p.container.contains(event.target));
         if (index === -1) return;
         desired = index;
+        userLockUntilLocal = Date.now() + USER_LOCK_LOCAL_MS;
         toWorker({ type: 'userSelect', local: index });
       },
       true

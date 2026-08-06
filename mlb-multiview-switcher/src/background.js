@@ -652,10 +652,49 @@ function currentIndex(tabId, panes) {
  */
 const manualHold = new Map();
 
+// The lock and the manual hold are the user's voice — they must survive
+// service-worker restarts and any in-memory reset. chrome.storage.session
+// lives exactly as long as the browser session, which is the right scope.
+function persistSessionState() {
+  try {
+    chrome.storage.session.set({
+      userLocks: Object.fromEntries(userLockUntil),
+      holds: Object.fromEntries([...manualHold].map(([t, h]) => [t, h.key])),
+    });
+  } catch {
+    // storage.session unavailable: in-memory state still works this lifetime.
+  }
+}
+
+function setUserLock(tabId, until) {
+  userLockUntil.set(tabId, until);
+  persistSessionState();
+}
+
+function setHold(tabId, key) {
+  manualHold.set(tabId, { key });
+  persistSessionState();
+}
+
+const stateReady = (async () => {
+  try {
+    const { userLocks, holds } = await chrome.storage.session.get(['userLocks', 'holds']);
+    for (const [t, until] of Object.entries(userLocks || {})) {
+      if (!userLockUntil.has(Number(t))) userLockUntil.set(Number(t), until);
+    }
+    for (const [t, key] of Object.entries(holds || {})) {
+      if (!manualHold.has(Number(t))) manualHold.set(Number(t), { key });
+    }
+  } catch {
+    // Nothing persisted yet.
+  }
+})();
+
 /** Move the audio to a specific pane. */
 async function promoteIndex(tabId, panes, index, options) {
   const target = panes[index];
   if (!target) return { ok: false, reason: 'pane index out of range' };
+  const prevCursor = cursor.has(tabId) ? cursor.get(tabId) : -1;
   cursor.set(tabId, index);
   lastSwitch.set(tabId, Date.now());
   lastAlive.set(tabId, Date.now()); // fresh pane, fresh evidence clock
@@ -664,28 +703,67 @@ async function promoteIndex(tabId, panes, index, options) {
   const source = (options && options.source) || 'extension';
   placedBy.set(tabId, source);
   const goLive = options && 'goLive' in options ? options.goLive : Boolean(target.gameLive);
-  let targetSend = null;
-  const sends = liveFrames(tabId, Date.now()).map((frame) => {
-    const message =
-      frame.frameId === target.frameId
-        ? // goLive: for a game the API says is in progress, snap the feed to
-          // the live edge on arrival. Never for finals — that's someone's
-          // replay position.
-          // pushMain: in the focus layout, our own placements also swap the
-          // audible tile onto the main stage. User clicks never rearrange.
-          { type: 'promote', local: target.local, goLive, pushMain: source !== 'user' }
-        : { type: 'demote' };
-    const send = chrome.tabs
-      .sendMessage(tabId, message, { frameId: frame.frameId })
+  const send = (frameId, message) =>
+    chrome.tabs
+      .sendMessage(tabId, message, { frameId })
       .catch(() => null); // a frame can vanish mid-switch; not fatal
-    if (frame.frameId === target.frameId) targetSend = send;
-    return send;
+
+  // Honour a content-side refusal by re-adopting the user's pane as cursor,
+  // hold and lock. The content script is the last line of defence: within a
+  // minute of a real click it refuses instructions that contradict the user,
+  // even when the worker's own lock and hold were lost (worker restart,
+  // spurious reset) — every lost-state incident showed up as audio being
+  // yanked seconds after a click.
+  const adoptRefusal = (frameId, refusal) => {
+    const kept = panes.findIndex((p) => p.frameId === frameId && p.local === refusal.local);
+    cursor.set(tabId, kept >= 0 ? kept : prevCursor);
+    if (kept >= 0) setHold(tabId, panes[kept].key);
+    setUserLock(tabId, Date.now() + USER_LOCK_MS);
+    placedBy.set(tabId, 'user');
+    logEvent(tabId, 'lock-refused', {
+      attempted: target.label,
+      kept: kept >= 0 ? panes[kept].label : null,
+    });
+    return { ok: false, reason: 'blocked by user lock' };
+  };
+  const isRefusal = (r) => r && r.ok === false && r.reason === 'user lock';
+
+  // Promote FIRST: if the target frame refuses, nothing has been demoted yet
+  // and the switch simply does not happen. goLive: for a game the API says is
+  // in progress, snap the feed to the live edge on arrival — never for
+  // finals, that's someone's replay position. pushMain: in the focus layout
+  // our own placements also swap the audible tile onto the main stage; user
+  // clicks never rearrange. force: the user's own click always wins over a
+  // stale content-side lock from an earlier click.
+  const promoted = await send(target.frameId, {
+    type: 'promote',
+    local: target.local,
+    goLive,
+    pushMain: source !== 'user',
+    force: source === 'user',
   });
-  await Promise.all(sends);
+  if (isRefusal(promoted)) return adoptRefusal(target.frameId, promoted);
+
+  const demotes = await Promise.all(
+    liveFrames(tabId, Date.now())
+      .filter((f) => f.frameId !== target.frameId)
+      .map((f) =>
+        send(f.frameId, { type: 'demote', force: source === 'user' }).then((r) => ({
+          frameId: f.frameId,
+          r,
+        }))
+      )
+  );
+  const refused = demotes.find(({ r }) => isRefusal(r));
+  if (refused) {
+    // Another frame is holding the pane the user clicked. Undo the promote so
+    // two frames don't play at once, then adopt the user's choice.
+    await send(target.frameId, { type: 'demote', force: true });
+    return adoptRefusal(refused.frameId, refused.r);
+  }
 
   // The focus-layout swap moved the feed to a new pane index; follow it so
   // the cursor keeps pointing at the game that carries the audio.
-  const promoted = targetSend ? await targetSend : null;
   const swap = promoted && promoted.swap;
   if (swap && swap.attempted) {
     logEvent(tabId, 'push-main', {
@@ -841,6 +919,7 @@ async function maybeTune(tabId, panes, settings, now) {
  */
 async function evaluate(tabId, { audioDead, blocked }) {
   const now = Date.now();
+  await stateReady;
   const settings = await currentSettings();
   const panes = paneList(tabId, now, settings);
   settlePendingTune(tabId, panes, now);
@@ -859,8 +938,10 @@ async function evaluate(tabId, { audioDead, blocked }) {
   const hold = manualHold.get(tabId);
   if (hold) {
     const held = panes.find((p) => p.key === hold.key);
-    if (!held) manualHold.delete(tabId);
-    else heldKey = hold.key;
+    if (!held) {
+      manualHold.delete(tabId);
+      persistSessionState();
+    } else heldKey = hold.key;
   }
 
   // Full pecking order: the user's click, then designated teams (unless being
@@ -887,8 +968,10 @@ async function evaluate(tabId, { audioDead, blocked }) {
 
     // Impatience: we JUST landed here. If this pane immediately shows a break
     // or dead air, the landing was bad — bail without waiting out the dwell,
-    // and heat the pane so the next escape avoids it.
-    const probing = sinceSwitch <= PROBE_MS;
+    // and heat the pane so the next escape avoids it. Only OUR landings probe:
+    // a pane the user placed is their judgement, not a landing to second-guess
+    // (the probe was ejecting user clicks within 2-5 seconds).
+    const probing = sinceSwitch <= PROBE_MS && placedBy.get(tabId) === 'extension';
     // Track commentary evidence for the audio pane: a fast clock for probe
     // bails, and a tolerant EMA for settled escapes.
     const heard = speech.get(tabId);
@@ -1040,6 +1123,7 @@ async function rotate(tabId) {
 const lastUserSelect = new Map();
 
 async function userSelect(tabId, frameId, local) {
+  await stateReady;
   const settings = await currentSettings();
   const now = Date.now();
   const prev = lastUserSelect.get(tabId);
@@ -1068,7 +1152,7 @@ async function userSelect(tabId, frameId, local) {
   // of desirability — refresh the hold and lock, teach nothing.
   if (abandoned) bump(clicked.affKey, CLICK_BOOST);
   if (abandoned && placedBy.get(tabId) === 'extension') bump(abandoned.affKey, -ABANDON_PENALTY);
-  userLockUntil.set(tabId, now + USER_LOCK_MS);
+  setUserLock(tabId, now + USER_LOCK_MS);
 
   // Clicking away = confirmed break on the abandoned pane. Toxic for the
   // length of an average ad pod, unconditionally.
@@ -1094,7 +1178,7 @@ async function userSelect(tabId, frameId, local) {
     panes: panes.map(snapPane),
   });
 
-  manualHold.set(tabId, { key: clicked.key });
+  setHold(tabId, clicked.key);
   await promoteIndex(tabId, panes, index, { goLive: false, source: 'user' });
 }
 
@@ -1224,8 +1308,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     // The top frame's content script booted: a genuine refresh/navigation.
+    // Prerendered documents also boot at frameId 0 — resetting on those would
+    // wipe the session the user is actively watching, so only active
+    // documents count (the content script guards this too; belt and braces).
     case 'pageBoot': {
       if (tabId == null) return false;
+      if (sender.documentLifecycle && sender.documentLifecycle !== 'active') return false;
       if ((sender.frameId ?? 0) === 0) softReset(tabId);
       return false;
     }
@@ -1374,6 +1462,7 @@ function softReset(tabId) {
   panePos.delete(tabId);
   userLockUntil.delete(tabId);
   escapeStrikes.delete(tabId);
+  persistSessionState();
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -1394,5 +1483,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   tuneStrikes.delete(tabId);
   tuneTripped.delete(tabId);
   escapeStrikes.delete(tabId);
+  userLockUntil.delete(tabId);
+  persistSessionState();
   if (speech.has(tabId)) stopListening(tabId);
 });

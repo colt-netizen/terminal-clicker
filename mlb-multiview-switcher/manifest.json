@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MLB Multiview Audio Switcher",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "description": "Keeps MLB.tv multiview audio on live baseball: tracks every game's state, follows your team priorities, and swaps dead panes for live games.",
   "permissions": [
     "storage",
