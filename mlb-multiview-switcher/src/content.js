@@ -506,6 +506,7 @@
       const marks = [
         p.stateText || '?',
         p.inBreak ? 'BREAK' : p.cooling ? 'cooling' : p.live ? 'live' : info.replayMode ? 'replay' : `dead: ${p.liveReason}`,
+        p.lean ? `lean ${p.lean > 0 ? '+' : ''}${p.lean}` : '',
         p.isPrimary ? 'audio' : '',
       ].filter(Boolean);
       lines.push(`  ${i + 1}. ${p.label} [${marks.join(' | ')}]`);

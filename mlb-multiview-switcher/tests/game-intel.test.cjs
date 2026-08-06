@@ -578,3 +578,26 @@ test('an upcoming-game pane is never replaced by another upcoming game', () => {
   });
   assert.strictEqual(target, null, 'pregame-for-pregame churn is pointless');
 });
+
+// --- click-feedback lean ---
+
+test('affinity decays by half-life and clamps garbage', () => {
+  const HL = 600000;
+  assert.strictEqual(Intel.decayedAffinity(null, 0, HL), 0);
+  assert.strictEqual(Intel.decayedAffinity({ v: 4, at: 0 }, 0, HL), 4);
+  const half = Intel.decayedAffinity({ v: 4, at: 0 }, HL, HL);
+  assert.ok(Math.abs(half - 2) < 1e-9, `expected 2, got ${half}`);
+  const quarter = Intel.decayedAffinity({ v: 4, at: 0 }, 2 * HL, HL);
+  assert.ok(Math.abs(quarter - 1) < 1e-9);
+  assert.strictEqual(Intel.decayedAffinity({ v: NaN, at: 0 }, 0, HL), 0);
+});
+
+test('lean folded into interest reorders the unranked tier', () => {
+  // A clicked-toward pane (lean +2 -> +30 interest) overtakes a slightly
+  // more "interesting" game the viewer keeps clicking away from.
+  const entries = [
+    { key: 'toolPick', teamRank: Number.MAX_SAFE_INTEGER, interest: 80 - 15 * 1.5, blowout: false },
+    { key: 'viewerPick', teamRank: Number.MAX_SAFE_INTEGER, interest: 70 + 15 * 2, blowout: false },
+  ];
+  assert.deepStrictEqual(Intel.buildPriorities(entries, null), ['viewerPick', 'toolPick']);
+});

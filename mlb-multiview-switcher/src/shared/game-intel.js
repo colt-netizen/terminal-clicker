@@ -337,6 +337,21 @@
     return [...held, ...teamed, ...rest].map((e) => e.key);
   }
 
+  // ------------------------------------------------------- click affinity
+
+  /**
+   * The viewer's clicks are ground truth about what the tool got wrong:
+   * clicking TO a pane says it is more desirable than what was chosen,
+   * clicking AWAY from an extension-chosen pane says that choice detracted.
+   * The lean is temporary — it halves every halfLifeMs — and the caller keys
+   * it by pane+game so a new game on the pane (or a page refresh) resets it.
+   */
+  function decayedAffinity(entry, now, halfLifeMs) {
+    if (!entry || !Number.isFinite(entry.v)) return 0;
+    const age = Math.max(0, now - (entry.at || 0));
+    return entry.v * Math.pow(0.5, age / (halfLifeMs || 600000));
+  }
+
   // ----------------------------------------------------------- break episodes
 
   /**
@@ -550,6 +565,7 @@
     teamBlowoutLoss,
     buildPriorities,
     breakEpisode,
+    decayedAffinity,
     orderKeys,
     tokensFromKey,
     paneLiveness,

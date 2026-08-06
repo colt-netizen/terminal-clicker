@@ -97,7 +97,33 @@ const AUDIO_ESCAPE_HEAT_MS = 90000;
  * commentary (speech most ticks) holds well above 0.3.
  */
 const ALIVE_ALPHA = 0.03;
-const ALIVE_ESCAPE_BELOW = 0.05;
+/**
+ * Context-scaled escape thresholds on the commentary-confidence EMA. The same
+ * silence means different things in different game states: between innings
+ * (Mid/End — where ad pods actually live) a short quiet stretch is enough to
+ * bail; mid-inning a play may be unfolding under a quiet booth, so escapes
+ * need deep, sustained silence; replays and unknowns sit between.
+ */
+const ESCAPE_CONF_PAUSED = 0.35; // ~10s of silence between innings
+const ESCAPE_CONF_LIVE = 0.02; // ~40s mid-inning — plays are sacred
+const ESCAPE_CONF_DEFAULT = 0.07; // ~25s on replays/unknown
+
+// Click-feedback learning: the viewer's clicks are ground truth about what
+// the tool got wrong. Lean is keyed to pane+game, so a new game on the pane
+// (or a page refresh) resets it — and within a game it decays on the scale of
+// the game itself: half-life ~2.6h, the average length of an MLB game. Clicks
+// are rare and precious signals; a lean that faded in minutes would never
+// accumulate enough to matter.
+const CLICK_BOOST = 2;
+const ABANDON_PENALTY = 1.5;
+const AFFINITY_WEIGHT = 15; // interest points per unit of lean
+const AFFINITY_HALF_LIFE_MS = 9400000; // ~2h37m, avg MLB game duration
+const AFFINITY_CAP = 6;
+
+/** tabId -> Map<affinityKey, {v, at}> — the temporary learned lean. */
+const paneAffinity = new Map();
+/** tabId -> who placed the audio last: 'extension' | 'user'. */
+const placedBy = new Map();
 
 /** tabId -> last time the audio pane demonstrably had commentary. */
 const lastAlive = new Map();
@@ -314,7 +340,12 @@ function paneList(tabId, now, opts) {
       }
       const away = game && game.teams.away.team;
       const home = game && game.teams.home.team;
+      const affKey = `${pane.key}|${game ? game.gamePk : '?'}`;
+      const affMap = paneAffinity.get(tabId);
+      const affinity = affMap ? Intel.decayedAffinity(affMap.get(affKey), now, AFFINITY_HALF_LIFE_MS) : 0;
       out.push({
+        affKey,
+        affinity,
         frameId: frame.frameId,
         local,
         key: pane.key,
@@ -410,6 +441,7 @@ async function promoteIndex(tabId, panes, index, options) {
   lastAlive.set(tabId, Date.now()); // fresh pane, fresh evidence clock
   aliveScore.set(tabId, 0.5);
 
+  placedBy.set(tabId, (options && options.source) || 'extension');
   const goLive = options && 'goLive' in options ? options.goLive : Boolean(target.gameLive);
   const sends = liveFrames(tabId, Date.now()).map((frame) => {
     const message =
@@ -582,7 +614,13 @@ async function evaluate(tabId, { audioDead, blocked }) {
   // first. Position 0 is THE most important game: the only pane upgrades may
   // return to when its ad ends. The rest of the order just aims escapes.
   const priorities = Intel.buildPriorities(
-    panes.map((p) => ({ key: p.key, teamRank: p.teamRank, interest: p.interest, blowout: p.blowout })),
+    panes.map((p) => ({
+      key: p.key,
+      teamRank: p.teamRank,
+      // The learned lean folds into watchability: clicks teach desirability.
+      interest: p.interest + AFFINITY_WEIGHT * p.affinity,
+      blowout: p.blowout,
+    })),
     heldKey
   );
   const topKey = priorities[0];
@@ -631,16 +669,22 @@ async function evaluate(tabId, { audioDead, blocked }) {
       priorities,
       currentIndex: currentIndex(tabId, panes),
       // Dead air escapes come from OUR commentary-confidence EMA when we can
-      // hear — not from the silence machine's pulses (whose backoff naps left
-      // audio parked on slates) and not from a strict continuous streak
-      // (which one stray murmur spike resets forever). The machine only
-      // matters in tab-flag mode, where there is no speech stream. A
-      // commentary lull during a play decays slowly and never reaches the
-      // escape threshold; a slate's drone gets there in ~30s.
-      audioDead:
-        badLanding ||
-        ((listening ? confidence < ALIVE_ESCAPE_BELOW : audioDead) &&
-          sinceSwitch >= AUDIO_DWELL_MS),
+      // hear, with thresholds scaled by game context: between innings (where
+      // ads live) bail fast; mid-inning (a play may be unfolding) require
+      // deep silence; replays sit between. The old silence machine only
+      // matters in tab-flag mode, where there is no speech stream.
+      audioDead: (() => {
+        if (badLanding) return true;
+        const escapeConf = current
+          ? current.paused
+            ? ESCAPE_CONF_PAUSED
+            : current.gameLive
+              ? ESCAPE_CONF_LIVE
+              : ESCAPE_CONF_DEFAULT
+          : ESCAPE_CONF_DEFAULT;
+        const dwellNeeded = current && current.paused ? SWITCH_COOLDOWN_MS : AUDIO_DWELL_MS;
+        return (listening ? confidence < escapeConf : audioDead) && sinceSwitch >= dwellNeeded;
+      })(),
       // Escapes always; upgrades only back to THE most important game (the
       // user's click or their designated team) once it is watchable again.
       allowUpgrade: 'top',
@@ -677,7 +721,7 @@ async function rotate(tabId) {
   const to = (from + 1) % panes.length;
   // Explicit user action — hold the destination like a direct click.
   manualHold.set(tabId, { key: panes[to].key });
-  return promoteIndex(tabId, panes, to);
+  return promoteIndex(tabId, panes, to, { source: 'user' });
 }
 
 /** The user physically clicked a pane: adopt it, hold it, and reconcile every
@@ -685,11 +729,31 @@ async function rotate(tabId) {
  * not a request to lose your place in it. */
 async function userSelect(tabId, frameId, local) {
   const settings = await currentSettings();
-  const panes = paneList(tabId, Date.now(), settings);
+  const now = Date.now();
+  const panes = paneList(tabId, now, settings);
   const index = panes.findIndex((p) => p.frameId === frameId && p.local === local);
   if (index === -1) return;
-  manualHold.set(tabId, { key: panes[index].key });
-  await promoteIndex(tabId, panes, index, { goLive: false });
+
+  // Learning: the click says the tool was slow or wrong. The clicked pane
+  // gains lean; the pane being abandoned loses some — but only if the
+  // extension chose it (leaving your own earlier click teaches nothing).
+  let affMap = paneAffinity.get(tabId);
+  if (!affMap) {
+    affMap = new Map();
+    paneAffinity.set(tabId, affMap);
+  }
+  const bump = (key, delta) => {
+    const prev = Intel.decayedAffinity(affMap.get(key), now, AFFINITY_HALF_LIFE_MS);
+    affMap.set(key, { v: Math.max(-AFFINITY_CAP, Math.min(AFFINITY_CAP, prev + delta)), at: now });
+  };
+  const clicked = panes[index];
+  bump(clicked.affKey, CLICK_BOOST);
+  const curIdx = currentIndex(tabId, panes);
+  const abandoned = curIdx >= 0 && curIdx !== index ? panes[curIdx] : null;
+  if (abandoned && placedBy.get(tabId) === 'extension') bump(abandoned.affKey, -ABANDON_PENALTY);
+
+  manualHold.set(tabId, { key: clicked.key });
+  await promoteIndex(tabId, panes, index, { goLive: false, source: 'user' });
 }
 
 // ------------------------------------------------------------- listen mode
@@ -844,6 +908,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             inBreak: p.inBreak,
             cooling: p.cooling,
             isPrimary: p.isPrimary,
+            lean: Math.round(p.affinity * 10) / 10,
           })),
           railCards: rail && now - rail.ts <= FRAME_TTL_MS ? rail.cards.length : 0,
           apiGames: schedule.games.length,
@@ -923,6 +988,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
+// Soft reset on refresh/navigation: learned lean, holds, heat and break
+// episodes belong to the session that taught them.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== 'loading') return;
+  paneAffinity.delete(tabId);
+  placedBy.delete(tabId);
+  manualHold.delete(tabId);
+  paneHeat.delete(tabId);
+  breakSeen.delete(tabId);
+  cursor.delete(tabId);
+  aliveScore.delete(tabId);
+  lastAlive.delete(tabId);
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   frames.delete(tabId);
   rails.delete(tabId);
@@ -933,6 +1012,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   paneHeat.delete(tabId);
   lastAlive.delete(tabId);
   aliveScore.delete(tabId);
+  paneAffinity.delete(tabId);
+  placedBy.delete(tabId);
   lastSwitch.delete(tabId);
   pendingTune.delete(tabId);
   lastTune.delete(tabId);
