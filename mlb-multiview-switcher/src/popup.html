@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>MLB Multiview Audio Switcher</title>
+    <link rel="stylesheet" href="ui.css" />
+  </head>
+  <body style="width: 320px">
+    <div class="status" id="status">reading tab…</div>
+
+    <h1>Teams you care about</h1>
+    <p class="hint" style="margin: -6px 0 8px">
+      Best first. A game featuring a ranked team outranks everything else — on screen now or
+      starting later.
+    </p>
+    <ul class="panes" id="teams"></ul>
+    <div class="row">
+      <input type="text" id="teamInput" placeholder="SD, Padres, Cubs…" style="flex: 1" />
+      <button id="teamAdd" type="button">Add</button>
+    </div>
+
+    <h1>On screen</h1>
+    <ul class="panes" id="panes"></ul>
+
+    <h1>Around the league</h1>
+    <ul class="panes games" id="games"></ul>
+
+    <div class="row">
+      <label for="enabled">Enabled</label>
+      <input type="checkbox" id="enabled" />
+    </div>
+
+    <div class="row">
+      <label for="autoTune">
+        Auto-load live games
+        <span class="hint">Swap panes showing dead games (final / not started) for live ones via the rail.</span>
+      </label>
+      <input type="checkbox" id="autoTune" />
+    </div>
+
+    <div class="row">
+      <label for="listenMode">
+        Listen for dead air
+        <span class="hint">Analyses tab audio to catch quiet stretches with no break banner.</span>
+      </label>
+      <input type="checkbox" id="listenMode" />
+    </div>
+
+    <div class="row">
+      <button id="switchNow" type="button">Switch now</button>
+      <button id="openOptions" type="button">Settings</button>
+    </div>
+
+    <div class="row">
+      <button id="copyLog" type="button">Copy debug log</button>
+      <button id="clearLog" type="button">Clear log</button>
+    </div>
+
+    <script src="shared/settings.js"></script>
+    <script src="shared/pane-selector.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

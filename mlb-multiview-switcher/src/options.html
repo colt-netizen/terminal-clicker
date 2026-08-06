@@ -1,0 +1,101 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>MLB Multiview Audio Switcher</title>
+    <link rel="stylesheet" href="ui.css" />
+  </head>
+  <body style="width: 420px">
+    <h1>MLB Multiview Audio Switcher</h1>
+
+    <div class="row">
+      <label for="enabled">Enabled</label>
+      <input type="checkbox" id="enabled" />
+    </div>
+
+    <div class="row">
+      <label for="silenceThresholdMs">
+        Silence before switching
+        <span class="hint">Chrome sits on its own audio flag for about 2s, so real-world delay ≈ this + 2s.</span>
+      </label>
+      <input type="number" id="silenceThresholdMs" min="500" max="60000" step="250" />
+    </div>
+
+    <div class="row">
+      <label for="graceMs">
+        Grace after a switch
+        <span class="hint">Time for the new pane to spin up before it counts as silent.</span>
+      </label>
+      <input type="number" id="graceMs" min="500" max="60000" step="250" />
+    </div>
+
+    <div class="row">
+      <label for="backoffMs">
+        Backoff after a full lap
+        <span class="hint">Every pane was silent — the whole multiview is quiet. Wait this long before trying again.</span>
+      </label>
+      <input type="number" id="backoffMs" min="0" max="600000" step="1000" />
+    </div>
+
+    <div class="row">
+      <label for="respectTabMute">
+        Stand down when the tab is muted
+        <span class="hint">A muted tab is a deliberate choice, so leave it alone.</span>
+      </label>
+      <input type="checkbox" id="respectTabMute" />
+    </div>
+
+    <div class="row">
+      <label for="debugOverlay">
+        Show debug overlay
+        <span class="hint">Corner readout: phase, audible, pane count, last action.</span>
+      </label>
+      <input type="checkbox" id="debugOverlay" />
+    </div>
+
+    <div class="row" style="display: block">
+      <label for="breakText">
+        Commercial break text
+        <span class="hint">
+          Case-insensitive pattern matched against each pane's on-screen text. MLB renders
+          “Commercial Break in Progress” over the paused game — this is the primary break signal.
+        </span>
+      </label>
+      <input type="text" id="breakText" placeholder="commercial break" />
+    </div>
+
+    <div class="row">
+      <label for="speechMarginDb">
+        Speech margin (dB)
+        <span class="hint">
+          Listen-mode only. How far above the ambient bed commentary must sit. Raise it if crowd
+          noise reads as talking; lower it if quiet commentary is missed.
+        </span>
+      </label>
+      <input type="number" id="speechMarginDb" min="1" max="40" step="1" />
+    </div>
+
+    <div class="row" style="display: block">
+      <label for="paneSelector">
+        Pane selector (advanced)
+        <span class="hint">
+          Leave empty to infer panes from the video elements. Set a CSS selector matching each pane's
+          container if the heuristic picks the wrong element on your layout.
+        </span>
+      </label>
+      <input type="text" id="paneSelector" placeholder="e.g. .multiview-grid > div" />
+    </div>
+
+    <div class="row">
+      <button id="reset" type="button">Restore defaults</button>
+      <span class="saved" id="saved">Saved</span>
+    </div>
+
+    <p class="note">
+      Changes apply immediately — no need to reload the MLB.tv tab.
+    </p>
+
+    <script src="shared/settings.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

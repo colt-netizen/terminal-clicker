@@ -137,6 +137,12 @@ cat ~/.terminal_monitor/daemon.log
 - Handle long-running deployments with prompts
 - Test suite monitoring and intervention
 
+## Also in this repo
+
+- **[mlb-multiview-switcher/](mlb-multiview-switcher/)** - A Chromium (MV3) browser
+  extension, unrelated to the Python tooling above. Watches an MLB.tv multiview
+  tab and promotes another game pane when the one carrying audio goes quiet.
+
 ## License
 
 MIT - Free to use and modify
