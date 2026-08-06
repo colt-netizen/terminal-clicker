@@ -257,6 +257,138 @@
     return m ? [m[1], m[2]] : [];
   }
 
+  // ------------------------------------------------------------- interest
+
+  /**
+   * How watchable a game is, from its score and inning: closeness plus
+   * lateness. A one-run game in the 9th far outranks a blowout in the 3rd.
+   * Replays score by how close the final was; previews barely register (they
+   * only matter when nothing is live).
+   */
+  function interestScore(game) {
+    const kind = classifyApiGame(game);
+    const ls = (game && game.linescore) || {};
+    const runsAway = ls.teams && ls.teams.away ? ls.teams.away.runs : undefined;
+    const runsHome = ls.teams && ls.teams.home ? ls.teams.home.runs : undefined;
+    const haveRuns = Number.isFinite(runsAway) && Number.isFinite(runsHome);
+    const diff = haveRuns ? Math.abs(runsAway - runsHome) : 2;
+    const closeness = Math.max(0, 20 - diff * 4);
+    const inning = ls.currentInning || 0;
+
+    if (kind === 'live' || kind === 'paused') {
+      let score = 50 + Math.min(27, inning * 3) + closeness;
+      if (inning > 9) score += 10; // extra innings
+      return score;
+    }
+    if (kind === 'final') return 30 + closeness;
+    if (kind === 'preview') return 10;
+    return 0;
+  }
+
+  /**
+   * Is a ranked team getting blown out? Down six or more from the sixth inning
+   * on, the designation stops pinning the audio — the user asked for a more
+   * interesting game when their team is losing heavily.
+   */
+  function teamBlowoutLoss(game, teamPriorities) {
+    const priorities = (teamPriorities || []).map(normalizeToken).filter(Boolean);
+    if (!priorities.length || !game) return false;
+    const ls = game.linescore || {};
+    if (!ls.teams || (ls.currentInning || 0) < 6) return false;
+
+    const sides = [
+      { team: game.teams.away.team, runs: ls.teams.away && ls.teams.away.runs },
+      { team: game.teams.home.team, runs: ls.teams.home && ls.teams.home.runs },
+    ];
+    for (let i = 0; i < sides.length; i++) {
+      const mine = sides[i];
+      const theirs = sides[1 - i];
+      if (!Number.isFinite(mine.runs) || !Number.isFinite(theirs.runs)) continue;
+      const ranked = teamAliases(mine.team).some((a) => priorities.includes(a));
+      if (ranked && theirs.runs - mine.runs >= 6) return true;
+    }
+    return false;
+  }
+
+  /**
+   * The full pecking order:
+   *   1. the pane the user manually placed the audio on — their click is the
+   *      strongest evidence of what matters and defaults to the top;
+   *   2. panes with a designated team (best rank first) — unless that team is
+   *      being blown out, in which case interest takes over;
+   *   3. everything else by interest, most watchable first.
+   *
+   * Position 0 of the result is the only pane upgrades may return to; the rest
+   * of the order just decides where escapes land.
+   *
+   * @param {Array<{key, teamRank, interest, blowout}>} entries in display order
+   */
+  function buildPriorities(entries, heldKey) {
+    const list = (entries || []).map((e, index) => ({ ...e, index }));
+    const held = heldKey ? list.filter((e) => e.key === heldKey) : [];
+    const heldKeys = new Set(held.map((e) => e.key));
+    const teamed = list
+      .filter((e) => !heldKeys.has(e.key) && e.teamRank !== Number.MAX_SAFE_INTEGER && !e.blowout)
+      .sort((a, b) => a.teamRank - b.teamRank || a.index - b.index);
+    const taken = new Set([...heldKeys, ...teamed.map((e) => e.key)]);
+    const rest = list
+      .filter((e) => !taken.has(e.key))
+      .sort((a, b) => (b.interest || 0) - (a.interest || 0) || a.index - b.index);
+    return [...held, ...teamed, ...rest].map((e) => e.key);
+  }
+
+  // ----------------------------------------------------------- break episodes
+
+  /**
+   * Break state as an episode with realistic timing, instead of reacting to
+   * every banner flicker. MLB's between-inning ad pods run ~2:15 (2:40 for
+   * national broadcasts), so:
+   *
+   *  - a sighting only *confirms* a break after persisting confirmMs (one
+   *    stray scan never triggers anything);
+   *  - once confirmed, the pane is locked in-break for minBreakMs regardless
+   *    of banner flicker — there is no point re-checking a 15s-old ad pod;
+   *  - past the lock, the break ends when the banner has been gone clearMs;
+   *  - after ending, the pane cools coolMs before it can receive audio again.
+   */
+  function breakEpisode(prev, sighted, now, opts = {}) {
+    const confirmMs = opts.confirmMs ?? 2000;
+    const minBreakMs = opts.minBreakMs ?? 110000;
+    const clearMs = opts.clearMs ?? 6000;
+    const coolMs = opts.coolMs ?? 30000;
+
+    let s = prev ? { ...prev } : null;
+    if (sighted) {
+      // A sighting extends the current episode while that episode is still
+      // in-break; otherwise (retired, cooling, or a stale unconfirmed blip)
+      // it starts a new pod.
+      let sameEpisode = false;
+      if (s) {
+        if (s.confirmedAt) {
+          const locked = now - s.confirmedAt < minBreakMs;
+          const recent = now - s.lastSeen < clearMs;
+          sameEpisode = locked || recent;
+        } else {
+          sameEpisode = now - s.lastSeen <= 30000;
+        }
+      }
+      if (!sameEpisode) s = { firstSeen: now, lastSeen: now, confirmedAt: 0 };
+      else s.lastSeen = now;
+      if (!s.confirmedAt && now - s.firstSeen >= confirmMs) s.confirmedAt = now;
+    }
+    if (!s) return { state: null, inBreak: false, cooling: false };
+
+    const confirmed = Boolean(s.confirmedAt);
+    const locked = confirmed && now - s.confirmedAt < minBreakMs;
+    const recentlySeen = now - s.lastSeen < clearMs;
+    const inBreak = confirmed && (locked || recentlySeen);
+    const endedAt = confirmed ? Math.max(s.lastSeen + clearMs, s.confirmedAt + minBreakMs) : 0;
+    const cooling = confirmed && !inBreak && now - endedAt < coolMs;
+    // Retire stale state so a new sighting starts a fresh episode.
+    if (!inBreak && !cooling && confirmed) return { state: null, inBreak: false, cooling: false };
+    return { state: s, inBreak, cooling };
+  }
+
   // -------------------------------------------------------------- liveness
 
   /** Pane text that means "this feed is filler, not baseball". */
@@ -325,35 +457,65 @@
     );
     const skip = new Set(skipGamePks || []);
 
-    // On a replay night there is nothing live to load — the watchable games
-    // are the finished ones the user hasn't put on screen.
-    const wantKind = replayMode ? 'final' : 'live';
+    // The hunt ladder: live games first; when nothing is live, the soonest
+    // upcoming game (its pregame feed turns into the game); on replay nights,
+    // finished games. A pane already showing an upcoming game is never
+    // replaced by another upcoming game — that would just churn pregame feeds.
+    const ladder = replayMode ? ['final'] : ['live', 'preview'];
 
-    /**
-     * A card is clickable for a game only if its own printed state agrees
-     * ("Bot 3" for live hunting, "Final" for replay hunting; unparseable text
-     * defers to the API). This is what disambiguates doubleheaders: both cards
-     * carry the same team tokens but print different states.
-     */
-    const cardShowsPlayable = (c) => {
-      const kind = parseRailState(c.text || '').kind;
-      return kind === wantKind || kind === 'unknown';
-    };
+    let best = null;
+    let bestKind = null;
+    for (const wantKind of ladder) {
+      /**
+       * A card is clickable for a game only if its own printed state agrees
+       * ("Bot 3" for live hunting, "Final" for replays; unparseable text
+       * defers to the API). This disambiguates doubleheaders: both cards
+       * carry the same team tokens but print different states.
+       */
+      const cardShowsPlayable = (c) => {
+        const kind = parseRailState(c.text || '').kind;
+        return kind === wantKind || kind === 'unknown';
+      };
 
-    const candidates = (games || [])
-      .filter((g) => classifyApiGame(g) === wantKind)
-      .filter((g) => !onScreen.has(g.gamePk) && !skip.has(g.gamePk))
-      .map((g) => {
-        const card = (railCards || []).findIndex(
-          (c) => !c.viewing && cardShowsPlayable(c) && matchGame([g], c.tokens || []) === g
+      const candidates = (games || [])
+        .filter((g) => classifyApiGame(g) === wantKind)
+        .filter((g) => !onScreen.has(g.gamePk) && !skip.has(g.gamePk))
+        .map((g) => {
+          const card = (railCards || []).findIndex(
+            (c) => !c.viewing && cardShowsPlayable(c) && matchGame([g], c.tokens || []) === g
+          );
+          return { game: g, cardIndex: card, rank: teamRankOfGame(g, teamPriorities) };
+        })
+        .filter((c) => c.cardIndex !== -1);
+      if (!candidates.length) continue;
+
+      if (wantKind === 'preview') {
+        // Soonest first — the next game to start.
+        candidates.sort(
+          (a, b) =>
+            a.rank - b.rank ||
+            String(a.game.gameDate || '').localeCompare(String(b.game.gameDate || '')) ||
+            a.game.gamePk - b.game.gamePk
         );
-        return { game: g, cardIndex: card, rank: teamRankOfGame(g, teamPriorities) };
-      })
-      .filter((c) => c.cardIndex !== -1);
-    if (!candidates.length) return null;
+      } else {
+        // Designated teams first, then the most watchable game.
+        candidates.sort(
+          (a, b) =>
+            a.rank - b.rank ||
+            interestScore(b.game) - interestScore(a.game) ||
+            a.game.gamePk - b.game.gamePk
+        );
+      }
+      best = candidates[0];
+      bestKind = wantKind;
+      break;
+    }
+    if (!best) return null;
 
-    candidates.sort((a, b) => a.rank - b.rank || a.game.gamePk - b.game.gamePk);
-    const best = candidates[0];
+    // Loading a preview over a preview is churn, not progress.
+    const replaceable =
+      bestKind === 'preview' ? deadPanes.filter(({ pane }) => pane.kind !== 'preview') : deadPanes;
+    if (!replaceable.length) return null;
 
     // Give up the least-loved dead pane (by the user's team priorities), and
     // among equals the later display position — the favourite's pane is the
@@ -363,12 +525,12 @@
         (games || []).find((g) => g.gamePk === pane.gamePk),
         teamPriorities
       );
-    deadPanes.sort((a, b) => paneRank(b) - paneRank(a) || b.index - a.index);
+    replaceable.sort((a, b) => paneRank(b) - paneRank(a) || b.index - a.index);
 
     return {
       gamePk: best.game.gamePk,
       cardIndex: best.cardIndex,
-      replaceIndex: deadPanes[0].index,
+      replaceIndex: replaceable[0].index,
     };
   }
 
@@ -384,6 +546,10 @@
     matchGameByText,
     matchByKey,
     teamRankOfGame,
+    interestScore,
+    teamBlowoutLoss,
+    buildPriorities,
+    breakEpisode,
     orderKeys,
     tokensFromKey,
     paneLiveness,

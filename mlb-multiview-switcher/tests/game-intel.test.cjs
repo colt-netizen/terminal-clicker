@@ -448,3 +448,133 @@ test('normal mode never proposes final games even with expendable panes', () => 
   });
   assert.strictEqual(target, null);
 });
+
+// --- interest, blowouts, and the pecking order ---
+
+function scoredGame(pk, awayRuns, homeRuns, inning, status = LIVE) {
+  return game(pk, SD, AZ, status, {
+    currentInning: inning,
+    inningHalf: 'Bottom',
+    teams: { away: { runs: awayRuns }, home: { runs: homeRuns } },
+  });
+}
+
+test('a late close game outscores an early blowout', () => {
+  const closeLate = Intel.interestScore(scoredGame(1, 3, 4, 9));
+  const blowoutEarly = Intel.interestScore(scoredGame(2, 0, 8, 3));
+  assert.ok(closeLate > blowoutEarly, `${closeLate} should beat ${blowoutEarly}`);
+});
+
+test('extra innings add excitement; finals score by closeness; previews barely register', () => {
+  assert.ok(Intel.interestScore(scoredGame(1, 4, 4, 11)) > Intel.interestScore(scoredGame(2, 4, 4, 9)));
+  const closeFinal = Intel.interestScore(scoredGame(3, 4, 5, 9, FINAL));
+  const routFinal = Intel.interestScore(scoredGame(4, 0, 9, 9, FINAL));
+  assert.ok(closeFinal > routFinal);
+  assert.ok(Intel.interestScore(game(5, SD, AZ, PREVIEW)) < routFinal);
+});
+
+test('blowout loss: ranked team down big late suspends the designation', () => {
+  const losing = scoredGame(1, 1, 8, 7); // SD (away) down 7 in the 7th
+  assert.strictEqual(Intel.teamBlowoutLoss(losing, ['Padres']), true);
+  assert.strictEqual(Intel.teamBlowoutLoss(losing, ['D-backs']), false, 'winning big is not a loss');
+  assert.strictEqual(Intel.teamBlowoutLoss(scoredGame(1, 1, 8, 3), ['Padres']), false, 'too early to give up');
+  assert.strictEqual(Intel.teamBlowoutLoss(losing, []), false);
+});
+
+test('pecking order: click first, then teams, then interest', () => {
+  const entries = [
+    { key: 'meh', teamRank: Number.MAX_SAFE_INTEGER, interest: 60, blowout: false },
+    { key: 'myteam', teamRank: 0, interest: 55, blowout: false },
+    { key: 'thriller', teamRank: Number.MAX_SAFE_INTEGER, interest: 95, blowout: false },
+    { key: 'clicked', teamRank: Number.MAX_SAFE_INTEGER, interest: 10, blowout: false },
+  ];
+  assert.deepStrictEqual(Intel.buildPriorities(entries, 'clicked'), [
+    'clicked',
+    'myteam',
+    'thriller',
+    'meh',
+  ]);
+});
+
+test('pecking order: a blown-out designated team falls to its interest slot', () => {
+  const entries = [
+    { key: 'myteam', teamRank: 0, interest: 40, blowout: true },
+    { key: 'thriller', teamRank: Number.MAX_SAFE_INTEGER, interest: 95, blowout: false },
+  ];
+  assert.deepStrictEqual(Intel.buildPriorities(entries, null), ['thriller', 'myteam']);
+});
+
+// --- break episodes: evidence-based, dialled to real ad pods ---
+
+test('a single banner flicker never confirms a break', () => {
+  let r = Intel.breakEpisode(null, true, 0);
+  assert.strictEqual(r.inBreak, false, 'one sighting is not evidence');
+  r = Intel.breakEpisode(r.state, false, 1000);
+  assert.strictEqual(r.inBreak, false);
+});
+
+test('a persisting banner confirms, then locks for the ad pod', () => {
+  let r = Intel.breakEpisode(null, true, 0);
+  r = Intel.breakEpisode(r.state, true, 2500);
+  assert.strictEqual(r.inBreak, true, 'persisted past confirm window');
+  // Banner flickers off mid-pod — the lock holds.
+  r = Intel.breakEpisode(r.state, false, 30000);
+  assert.strictEqual(r.inBreak, true, 'no point re-checking a 30s-old ad pod');
+  r = Intel.breakEpisode(r.state, false, 100000);
+  assert.strictEqual(r.inBreak, true, 'still inside the typical pod');
+});
+
+test('the break ends only after the pod and a clear gap, then cools', () => {
+  // Banner scanned every 4s (real cadence is 1s) through a long national pod.
+  let r = { state: null };
+  for (let t = 0; t <= 140000; t += 4000) r = Intel.breakEpisode(r.state, true, t);
+  assert.strictEqual(r.inBreak, true, 'banner still visible past the min lock');
+  // Banner gone; not yet clear.
+  r = Intel.breakEpisode(r.state, false, 143000);
+  assert.strictEqual(r.inBreak, true, 'clear window not served');
+  // Gone long enough: over, and cooling.
+  r = Intel.breakEpisode(r.state, false, 150000);
+  assert.strictEqual(r.inBreak, false);
+  assert.strictEqual(r.cooling, true, 'just-ended break cools');
+  // Cooling expires; state retires.
+  r = Intel.breakEpisode(r.state, false, 185000);
+  assert.strictEqual(r.cooling, false);
+  assert.strictEqual(r.state, null, 'episode retired');
+});
+
+// --- tune ladder: live, then soonest upcoming ---
+
+test('with no live games, tune loads the soonest upcoming game over a finished pane', () => {
+  const NYM = team('NYM', 'Mets', 'New York');
+  const CLE = team('CLE', 'Guardians', 'Cleveland');
+  const games = [
+    game(50, LAD, CHC, FINAL),
+    { ...game(51, NYM, CLE, PREVIEW), gameDate: '2026-08-06T17:10:00Z' },
+    { ...game(52, SF, TEX, PREVIEW), gameDate: '2026-08-06T15:35:00Z' },
+  ];
+  const target = Intel.pickTuneTarget({
+    panes: [{ live: false, inBreak: false, gamePk: 50, kind: 'final' }, { live: true, gamePk: 1 }],
+    games,
+    railCards: [
+      { tokens: ['NYM', 'CLE'], viewing: false, text: '5:10 PMNYMCLE' },
+      { tokens: ['SF', 'TEX'], viewing: false, text: '3:35 PMSFTEX' },
+    ],
+    teamPriorities: [],
+  });
+  assert.ok(target);
+  assert.strictEqual(target.gamePk, 52, 'the 3:35 start beats the 5:10 start');
+});
+
+test('an upcoming-game pane is never replaced by another upcoming game', () => {
+  const games = [{ ...game(52, SF, TEX, PREVIEW), gameDate: '2026-08-06T15:35:00Z' }];
+  const target = Intel.pickTuneTarget({
+    panes: [
+      { live: false, inBreak: false, gamePk: 60, kind: 'preview' },
+      { live: true, gamePk: 1 },
+    ],
+    games,
+    railCards: [{ tokens: ['SF', 'TEX'], viewing: false, text: '3:35 PMSFTEX' }],
+    teamPriorities: [],
+  });
+  assert.strictEqual(target, null, 'pregame-for-pregame churn is pointless');
+});

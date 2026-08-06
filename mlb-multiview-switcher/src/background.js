@@ -65,29 +65,34 @@ const SWITCH_COOLDOWN_MS = 2500;
  */
 const AUDIO_DWELL_MS = 20000;
 /**
- * A break only counts as over after the banner has been GONE this long.
- * Overlay detection can flicker as the page re-renders; without stickiness,
- * one missed scan reads as "break ended", the return rule fires, and the
- * audio dives straight back into the commercial.
- */
-const BREAK_CLEAR_MS = 6000;
-/**
- * After a pane's break banner clears it stays "cooling" this long: not a
- * reason to leave it, but ineligible as a destination. A pane that just
- * showed a commercial does not get the audio back the moment it looks clean —
- * flickery detection kept luring the audio straight back into slates.
- */
-const BREAK_COOL_MS = 45000;
-/**
  * Impatience window after a switch: if the pane we just landed on shows a
  * break or dead air within this window, the landing was premature — bail
  * immediately (no dwell) and heat the pane so the next escape avoids it.
  * Patience is for games we are settled into, not for bad landings.
  */
 const PROBE_MS = 8000;
+/** How long a bad-landing pane stays heated (ineligible as a destination). */
+const HEAT_MS = 30000;
+/**
+ * Dead air must be CONTINUOUS this long before it may move audio off a pane
+ * we otherwise believe is playing. Commentators go quiet during action — the
+ * crowd is flat, the spread gate reads "no speech" — and a few seconds of
+ * that was ejecting the user out of live plays. A real slate murmurs for two
+ * minutes; a commentary lull rarely stretches past thirty seconds.
+ */
+const DEAD_AIR_ESCAPE_MS = 45000;
 
-/** tabId -> Map<paneKey, when the break banner was last seen>. */
+/** tabId -> last time the audio pane demonstrably had commentary. */
+const lastAlive = new Map();
+
+/**
+ * tabId -> Map<paneKey, break episode state> (see Intel.breakEpisode).
+ * Break timing — confirmation, the ~2min ad-pod lock, clear, cooling — all
+ * lives in the episode model, dialled to how long MLB ad pods actually run.
+ */
 const breakSeen = new Map();
+/** tabId -> Map<paneKey, heated-until timestamp> for premature landings. */
+const paneHeat = new Map();
 
 /** tabId -> timestamp of the last promotion. */
 const lastSwitch = new Map();
@@ -257,13 +262,17 @@ function paneList(tabId, now, teamPriorities) {
         Intel.matchGame(games, tokens) ||
         Intel.matchGameByText(games, pane.text);
 
-      // Sticky break: entering is immediate, leaving requires the banner to
-      // stay gone for BREAK_CLEAR_MS. After that the pane keeps cooling for
-      // BREAK_COOL_MS — watchable to stay on, ineligible to switch to.
-      if (pane.inBreak) seen.set(pane.key, now);
-      const sinceBanner = seen.has(pane.key) ? now - seen.get(pane.key) : Infinity;
-      const inBreak = Boolean(pane.inBreak) || sinceBanner < BREAK_CLEAR_MS;
-      const cooling = !inBreak && sinceBanner < BREAK_COOL_MS;
+      // Evidence-based break state: a sighting must persist to confirm, a
+      // confirmed break locks for a realistic ad-pod length, ending requires
+      // the banner to stay gone, and an ended break cools before the pane can
+      // receive audio again.
+      const episode = Intel.breakEpisode(seen.get(pane.key) || null, Boolean(pane.inBreak), now);
+      if (episode.state) seen.set(pane.key, episode.state);
+      else seen.delete(pane.key);
+      const heatMap = paneHeat.get(tabId);
+      const heated = heatMap ? (heatMap.get(pane.key) || 0) > now : false;
+      const inBreak = episode.inBreak;
+      const cooling = episode.cooling || heated;
       pane = { ...pane, inBreak };
 
       let railState = null;
@@ -292,8 +301,11 @@ function paneList(tabId, now, teamPriorities) {
         isPrimary: frame.primaryLocal === local,
         gamePk: game ? game.gamePk : null,
         gameLive: game ? Intel.classifyApiGame(game) === 'live' : false,
+        kind: game ? Intel.classifyApiGame(game) : '',
         stateText: game ? Intel.describeApiGame(game) : railState ? railState.kind : '',
         teamRank: Intel.teamRankOfGame(game, teamPriorities || []),
+        interest: game ? Intel.interestScore(game) : 0,
+        blowout: game ? Intel.teamBlowoutLoss(game, teamPriorities || []) : false,
         live: liveness.live,
         liveReason: liveness.reason,
         // For the selector: dead-but-not-break panes are ineligible with a
@@ -366,6 +378,7 @@ async function promoteIndex(tabId, panes, index, options) {
   if (!target) return { ok: false, reason: 'pane index out of range' };
   cursor.set(tabId, index);
   lastSwitch.set(tabId, Date.now());
+  lastAlive.set(tabId, Date.now()); // fresh pane, fresh evidence clock
 
   const goLive = options && 'goLive' in options ? options.goLive : Boolean(target.gameLive);
   const sends = liveFrames(tabId, Date.now()).map((frame) => {
@@ -474,6 +487,7 @@ async function maybeTune(tabId, panes, settings, now) {
       live: p.live,
       inBreak: p.inBreak,
       gamePk: p.gamePk,
+      kind: p.kind,
       expendable: expendable(p),
     })),
     games,
@@ -533,15 +547,15 @@ async function evaluate(tabId, { audioDead, blocked }) {
     else heldKey = hold.key;
   }
 
-  // Only *explicit* preferences rank: the held pane, then panes featuring the
-  // user's ranked teams. Everything else is deliberately unranked — auto-
-  // discovered display order is NOT a preference, and treating it as one is
-  // what glued the audio to the top-left pane and fought the user's clicks.
-  const teamRanked = panes
-    .filter((p) => p.teamRank !== Number.MAX_SAFE_INTEGER && p.key !== heldKey)
-    .sort((a, b) => a.teamRank - b.teamRank)
-    .map((p) => p.key);
-  const priorities = heldKey ? [heldKey, ...teamRanked] : teamRanked;
+  // Full pecking order: the user's click, then designated teams (unless being
+  // blown out), then everything else by interest — closest, latest games
+  // first. Position 0 is THE most important game: the only pane upgrades may
+  // return to when its ad ends. The rest of the order just aims escapes.
+  const priorities = Intel.buildPriorities(
+    panes.map((p) => ({ key: p.key, teamRank: p.teamRank, interest: p.interest, blowout: p.blowout })),
+    heldKey
+  );
+  const topKey = priorities[0];
 
   let switched = { switched: false };
   if (now - (lastSwitch.get(tabId) || 0) >= SWITCH_COOLDOWN_MS) {
@@ -552,26 +566,40 @@ async function evaluate(tabId, { audioDead, blocked }) {
     // or dead air, the landing was bad — bail without waiting out the dwell,
     // and heat the pane so the next escape avoids it.
     const probing = sinceSwitch <= PROBE_MS;
+    // Track how long the audio pane has demonstrably lacked commentary.
+    const heard = speech.get(tabId);
+    if (!lastAlive.has(tabId)) lastAlive.set(tabId, now);
+    if (heard && now - heard.ts < SPEECH_TTL_MS && heard.speechPresent) lastAlive.set(tabId, now);
+    const deadStreak = now - lastAlive.get(tabId);
+
     const badLanding = probing && current && (current.inBreak || audioDead);
     if (badLanding && current) {
-      const seenMap = breakSeen.get(tabId);
-      if (seenMap) seenMap.set(current.key, now);
+      let heatMap = paneHeat.get(tabId);
+      if (!heatMap) {
+        heatMap = new Map();
+        paneHeat.set(tabId, heatMap);
+      }
+      heatMap.set(current.key, now + HEAT_MS);
     }
 
     const decision = Selector.choose({
-      panes,
+      // The most important pane is exempt from cooling: when its ad genuinely
+      // ends (the episode model guarantees that took ad-pod time), the audio
+      // returns without serving a second sentence.
+      panes: panes.map((p) => (p.key === topKey ? { ...p, cooling: false } : p)),
       priorities,
       currentIndex: currentIndex(tabId, panes),
-      // Dead air may only move the audio once per dwell window when settled;
-      // a bad landing gets no such patience. Definite signals (breaks, dead
+      // Dead air alone moves audio only when it has been CONTINUOUS for
+      // DEAD_AIR_ESCAPE_MS and we're past the dwell — a commentary lull during
+      // a play must never eject the user from an active game. A bad landing
+      // (probe window) keeps its fast bail. Definite signals (breaks, dead
       // games) keep the ordinary cooldown either way.
-      audioDead: audioDead && (badLanding || sinceSwitch >= AUDIO_DWELL_MS),
-      // Never. The tool exists to escape ad breaks and dead games, not to
-      // "improve" on a game that is being played. While the current pane is
-      // showing baseball, nothing outranks it — priorities only pick where an
-      // escape lands. The user moves the audio by clicking; we move it only
-      // when their game stops.
-      allowUpgrade: false,
+      audioDead:
+        audioDead &&
+        (badLanding || (sinceSwitch >= AUDIO_DWELL_MS && deadStreak >= DEAD_AIR_ESCAPE_MS)),
+      // Escapes always; upgrades only back to THE most important game (the
+      // user's click or their designated team) once it is watchable again.
+      allowUpgrade: 'top',
     });
     if (decision) {
       const result = await promoteIndex(tabId, panes, decision.index);
@@ -833,6 +861,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   status.delete(tabId);
   cursor.delete(tabId);
   manualHold.delete(tabId);
+  breakSeen.delete(tabId);
+  paneHeat.delete(tabId);
+  lastAlive.delete(tabId);
   lastSwitch.delete(tabId);
   pendingTune.delete(tabId);
   lastTune.delete(tabId);
