@@ -88,7 +88,17 @@ const DEAD_AIR_ESCAPE_MS = 45000;
  * watchable" is no evidence. Without this, escape + return-to-top boomerangs
  * the audio straight back into the slate.
  */
-const AUDIO_ESCAPE_HEAT_MS = 90000;
+const AUDIO_ESCAPE_HEAT_MS = 150000; // avg MLB ad pod (2:15-2:45) with margin
+/**
+ * A user clicking AWAY from a pane is the strongest break detector in the
+ * system: they are looking at it. The abandoned pane is toxic waste for the
+ * length of an average ad break - no destination eligibility, no team-rank
+ * exemption, no top-slot exemption, regardless of who placed the audio there.
+ * Without this, a team-designated pane's in-stream commercial (invisible to
+ * DOM scans) stayed eternally eligible and every escape dumped the audio
+ * straight back into it.
+ */
+const CLICK_AWAY_HEAT_MS = 150000;
 /**
  * Commentary confidence for the audio pane: an EMA of speech presence rather
  * than a strict continuous streak — one stray murmur spike must not reset a
@@ -827,9 +837,21 @@ async function userSelect(tabId, frameId, local) {
   const abandoned = curIdx >= 0 && curIdx !== index ? panes[curIdx] : null;
   if (abandoned && placedBy.get(tabId) === 'extension') bump(abandoned.affKey, -ABANDON_PENALTY);
 
+  // Clicking away = confirmed break on the abandoned pane. Toxic for the
+  // length of an average ad pod, unconditionally.
+  if (abandoned) {
+    let heatMap = paneHeat.get(tabId);
+    if (!heatMap) {
+      heatMap = new Map();
+      paneHeat.set(tabId, heatMap);
+    }
+    heatMap.set(abandoned.key, now + CLICK_AWAY_HEAT_MS);
+  }
+
   logEvent(tabId, 'click-correction', {
     clicked: snapPane(clicked),
     abandoned: abandoned ? snapPane(abandoned) : null,
+    heatAppliedMs: abandoned ? CLICK_AWAY_HEAT_MS : 0,
     placedBy: placedBy.get(tabId) || null,
     // How long after our placement the user overrode it: the "too slow or
     // wrong" measurement.
