@@ -1,11 +1,59 @@
 # MLB Multiview Audio Switcher
 
-A Chromium (MV3) extension for MLB.tv **multiview**. When the pane that currently
-carries audio goes quiet, it promotes another pane — and keeps rotating until it
-lands on one that actually has sound.
+A Chromium (MV3) extension for MLB.tv **multiview** that keeps you plugged into
+live baseball. It knows the state of every game in the league, ranks games by
+the teams you care about, moves the audio to the best live game, and — when a
+pane's game ends or hasn't started — swaps that pane for a live game via the
+page's own rail.
 
 Built for Comet on macOS, but it is a stock MV3 extension: Chrome, Brave, Edge,
 Arc and anything else Chromium-based will load it the same way.
+
+## How it knows what's a live game
+
+Two independent sources, no AI, no cost:
+
+- **MLB's public stats API** (`statsapi.mlb.com` — free, unauthenticated, the
+  same data the site itself runs on). One ~5KB fetch every 45 seconds, only
+  while an MLB tab is open, returns every game's state (Preview / Live / Final),
+  the inning (`Bot 8`), both teams, and start times. This is the source of
+  truth.
+- **The page's game rail** — the strip of cards across the top of multiview
+  that prints `Bot 8` / `Final` / `1:20 PM` per game. Parsed as a fallback for
+  when the API is unreachable, and used as the *control surface* for loading
+  new games into panes.
+
+A pane counts as **live baseball** only if: it has no break banner, its matched
+game is In Progress (not Final, not pre-game, not rain-delayed), and it isn't
+showing filler ("Coming Up", "First Pitch…").
+
+One asymmetric rule squeezes out extra seconds of baseball without any
+flapping: a game sitting **between half-innings** (the API's `Middle`/`End`
+inning state — the broadcast's commercial window) is never *chosen as a
+destination*, but being between innings is never a reason to *leave* a game
+either. So the switcher won't bounce you at every half-inning, but when it does
+move — off a break, off a final — it lands on a game where the ball is live,
+and return-to-favourite waits until your team is actually back on the field.
+
+## Team priorities
+
+Rank teams in the popup ("SD", "Padres" — abbreviations and names both work).
+A game featuring a ranked team outranks every unranked game, whether it's on
+screen or not. The per-feed ↑/↓ order still exists as the tiebreak when no
+ranked team is involved.
+
+## Auto-tune
+
+When a pane's game is dead (Final, or not started) and a live game exists that
+isn't on screen, the extension drives the page's own rail: it focuses the dead
+pane, then clicks the target game's card. Your favourite teams pick the target;
+the least-favourite dead pane is the one given up.
+
+Every attempt is verified: if the target game doesn't appear among the panes
+within 10 seconds, that game is benched for 10 minutes — and after three
+consecutive failures auto-tune stops driving the rail entirely (the popup and
+HUD say so) rather than clicking a page that isn't responding. Toggling any
+setting resets the strikes.
 
 ## Install
 
@@ -128,10 +176,15 @@ Turn on the **debug overlay** and read `panes`:
 for f in tests/*.cjs; do node --test "$f"; done
 ```
 
-43 tests over the three pure modules:
+71 tests over the four pure modules:
 
-- **pane-selector** (17) — priority order, leaving a break, return-to-favourite,
-  holding when everything is on a break, 2/3/4-game mode transitions.
+- **game-intel** (25) — rail text parsing ("Bot 8" / "Final" / "1:20 PM"),
+  stats-API state classification (incl. Warmup, rain delays, Game Over), team
+  matching (the LA/LAD/LAA ambiguity, city collisions), team-priority ranking,
+  pane liveness, and auto-tune target selection. Fixtures mirror real API
+  responses captured live.
+- **pane-selector** (20) — priority order, leaving a break, leaving dead games,
+  return-to-favourite, holding when everything is dead, 2/3/4-game transitions.
 - **silence-machine** (13) — thresholds, grace suppression, backoff, attempt
   reset, the disabled/single-pane no-ops, purity.
 - **speech-detector** (13) — steady crowd noise and music rejected, commentary

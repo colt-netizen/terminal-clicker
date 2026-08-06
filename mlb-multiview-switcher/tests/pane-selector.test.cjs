@@ -158,3 +158,86 @@ test('reorder clamps at the ends and ignores unknown keys', () => {
   assert.deepStrictEqual(reorder(['a', 'b'], 'b', 1), ['a', 'b']);
   assert.deepStrictEqual(reorder(['a', 'b'], 'zz', -1), ['a', 'b']);
 });
+
+// --- notLive: game-state awareness ---
+
+test('leaves a pane whose game is not live baseball', () => {
+  const result = choose({
+    panes: [{ key: 'a', inBreak: false, notLive: true, notLiveReason: 'game is final' }, pane('b')],
+    priorities: ['a', 'b'],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result.index, 1);
+  assert.strictEqual(result.reason, 'game is final');
+});
+
+test('never selects a notLive pane as the destination', () => {
+  const result = choose({
+    panes: [pane('a', true), { key: 'b', notLive: true }, pane('c')],
+    priorities: ['a', 'b', 'c'],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result.index, 2, 'b is dead even though it outranks c');
+});
+
+test('holds when every alternative is dead, even mid-break', () => {
+  const result = choose({
+    panes: [pane('a', true), { key: 'b', notLive: true }],
+    priorities: ['a', 'b'],
+    currentIndex: 0,
+    audioDead: true,
+  });
+  assert.strictEqual(result, null);
+});
+
+// --- paused: between half-innings (destination filter only) ---
+
+test('being between innings is never a reason to leave', () => {
+  const result = choose({
+    panes: [{ key: 'a', paused: true }, pane('b')],
+    priorities: ['a', 'b'],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result, null, 'no half-inning ping-pong');
+});
+
+test('a paused pane is never picked as a destination', () => {
+  const result = choose({
+    panes: [pane('a', true), { key: 'b', paused: true }, pane('c')],
+    priorities: ['a', 'b', 'c'],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result.index, 2, 'b outranks c but is between innings');
+});
+
+test('return-to-favourite waits until the favourite is back in action', () => {
+  const paused = choose({
+    panes: [{ key: 'fav', paused: true }, pane('other')],
+    priorities: ['fav', 'other'],
+    currentIndex: 1,
+    audioDead: false,
+  });
+  assert.strictEqual(paused, null, 'favourite is between innings — stay put');
+
+  const resumed = choose({
+    panes: [pane('fav'), pane('other')],
+    priorities: ['fav', 'other'],
+    currentIndex: 1,
+    audioDead: false,
+  });
+  assert.strictEqual(resumed.index, 0, 'favourite resumed — go back');
+});
+
+test('holds through a break when every alternative is between innings', () => {
+  const result = choose({
+    panes: [pane('a', true), { key: 'b', paused: true }],
+    priorities: ['a', 'b'],
+    currentIndex: 0,
+    audioDead: true,
+  });
+  assert.strictEqual(result, null);
+});

@@ -5,19 +5,37 @@
     <title>MLB Multiview Audio Switcher</title>
     <link rel="stylesheet" href="ui.css" />
   </head>
-  <body style="width: 300px">
+  <body style="width: 320px">
     <div class="status" id="status">reading tab…</div>
 
-    <h1>Priority</h1>
+    <h1>Teams you care about</h1>
     <p class="hint" style="margin: -6px 0 8px">
-      Top of the list wins. When your favourite goes to a commercial break the audio drops to the
-      next one down, then comes back up when the break ends.
+      Best first. A game featuring a ranked team outranks everything else — on screen now or
+      starting later.
     </p>
+    <ul class="panes" id="teams"></ul>
+    <div class="row">
+      <input type="text" id="teamInput" placeholder="SD, Padres, Cubs…" style="flex: 1" />
+      <button id="teamAdd" type="button">Add</button>
+    </div>
+
+    <h1>On screen</h1>
     <ul class="panes" id="panes"></ul>
+
+    <h1>Around the league</h1>
+    <ul class="panes games" id="games"></ul>
 
     <div class="row">
       <label for="enabled">Enabled</label>
       <input type="checkbox" id="enabled" />
+    </div>
+
+    <div class="row">
+      <label for="autoTune">
+        Auto-load live games
+        <span class="hint">Swap panes showing dead games (final / not started) for live ones via the rail.</span>
+      </label>
+      <input type="checkbox" id="autoTune" />
     </div>
 
     <div class="row">

@@ -29,7 +29,9 @@
 
   /**
    * @param {object} input
-   * @param {Array<{key: string, inBreak: boolean}>} input.panes  in display order
+   * @param {Array<{key: string, inBreak: boolean, notLive?: boolean, notLiveReason?: string}>}
+   *   input.panes  in display order; notLive marks a pane whose game is not
+   *   currently being played (final, not started, delayed, filler feed)
    * @param {string[]} input.priorities     pane keys, best first
    * @param {number} input.currentIndex     pane carrying audio now, -1 if unknown
    * @param {boolean} input.audioDead       silence machine says nothing is playing
@@ -41,10 +43,16 @@
     const ranked = panes.map((pane, index) => ({
       index,
       inBreak: Boolean(pane.inBreak),
+      notLive: Boolean(pane.notLive),
+      notLiveReason: pane.notLiveReason,
+      // Between half-innings: not a reason to leave (that would bounce the
+      // audio every half-inning), but never a destination either — arriving
+      // during the commercial window buys zero seconds of baseball.
+      paused: Boolean(pane.paused),
       rank: rankOf(pane.key, priorities),
     }));
 
-    const available = ranked.filter((p) => !p.inBreak);
+    const available = ranked.filter((p) => !p.inBreak && !p.notLive && !p.paused);
     // Every game is on a break at once. Moving would only trade one break for
     // another, so hold and let the caller back off.
     if (!available.length) return null;
@@ -64,6 +72,9 @@
     const other = pick(alternatives);
 
     if (current.inBreak) return { index: other.index, reason: 'current pane is on a commercial break' };
+    if (current.notLive) {
+      return { index: other.index, reason: current.notLiveReason || 'current pane is not live baseball' };
+    }
     if (other.rank < current.rank) return { index: other.index, reason: 'a higher-priority game is available' };
     if (audioDead) return { index: other.index, reason: 'no audio on the current pane' };
 

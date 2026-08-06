@@ -12,94 +12,163 @@ async function activeTab() {
 
 const send = (msg) => chrome.runtime.sendMessage(msg).catch(() => null);
 
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function tag(text, on) {
+  return el('span', 'tag' + (on ? ' on' : ''), text);
+}
+
 function renderStatus(state) {
-  const el = $('status');
+  const box = $('status');
   if (!state) {
-    el.textContent = 'not an MLB.tv tab';
+    box.textContent = 'not an MLB.tv tab';
     return;
   }
   const signal = state.listening
     ? `speech ${state.recentDb}dB / floor ${state.floorDb}dB`
     : 'tab audio flag';
-  el.textContent = [
+  const lines = [
     `panes    ${state.totalPanes}`,
     `playing  ${state.audible}`,
     `signal   ${signal}`,
     `phase    ${state.stale ? 'not running' : state.phase}`,
-  ].join('\n');
+  ];
+  if (state.games && state.games.apiError) lines.push(`api      ${state.games.apiError}`);
+  if (state.tuneTripped) lines.push('tune     paused — rail clicks not landing');
+  box.textContent = lines.join('\n');
 }
 
-/**
- * The priority list is the union of games seen on this tab and any ranked
- * earlier, so a game keeps its slot when you drop from 4-game to 2-game mode.
- */
-function renderPanes(state) {
-  const list = $('panes');
-  const live = new Map((state && state.panes ? state.panes : []).map((p) => [p.key, p]));
-  const order = Selector.mergePriorities(settings.priorities, [...live.keys()]);
+// ----------------------------------------------------------- team priorities
 
+async function saveTeams(teams) {
+  settings = { ...settings, teamPriorities: teams };
+  await Settings.save({ teamPriorities: teams });
+  renderTeams();
+}
+
+function renderTeams() {
+  const list = $('teams');
+  const teams = settings.teamPriorities || [];
   list.innerHTML = '';
-  if (!order.length) {
-    const li = document.createElement('li');
-    li.className = 'empty';
-    li.textContent = 'No games detected yet.';
-    list.appendChild(li);
+  if (!teams.length) {
+    list.appendChild(el('li', 'empty', 'No teams ranked — using per-feed order below.'));
     return;
   }
-
-  order.forEach((key, i) => {
-    const pane = live.get(key);
-    const li = document.createElement('li');
-
-    const name = document.createElement('span');
-    name.className = 'pane-name' + (pane ? '' : ' offscreen');
-    name.textContent = pane ? pane.label : `${key.replace(/^[a-z]+:/, '')} (not on screen)`;
-    li.appendChild(name);
-
-    if (pane && pane.inBreak) {
-      const tag = document.createElement('span');
-      tag.className = 'tag';
-      tag.textContent = 'break';
-      li.appendChild(tag);
-    }
-    if (pane && pane.isPrimary) {
-      const tag = document.createElement('span');
-      tag.className = 'tag on';
-      tag.textContent = 'audio';
-      li.appendChild(tag);
-    }
-
+  teams.forEach((team, i) => {
+    const li = el('li');
+    li.appendChild(el('span', 'pane-name', `${i + 1}. ${team}`));
     for (const [delta, glyph, title] of [
-      [-1, '↑', 'Higher priority'],
-      [1, '↓', 'Lower priority'],
+      [-1, '↑', 'Higher'],
+      [1, '↓', 'Lower'],
     ]) {
-      const button = document.createElement('button');
-      button.className = 'move';
-      button.textContent = glyph;
+      const button = el('button', 'move', glyph);
       button.title = title;
-      button.disabled = (delta === -1 && i === 0) || (delta === 1 && i === order.length - 1);
-      button.addEventListener('click', async () => {
-        settings = { ...settings, priorities: Selector.reorder(order, key, delta) };
-        await Settings.save(settings);
-        refresh();
-      });
+      button.disabled = (delta === -1 && i === 0) || (delta === 1 && i === teams.length - 1);
+      button.addEventListener('click', () => saveTeams(Selector.reorder(teams, team, delta)));
       li.appendChild(button);
     }
-
+    const remove = el('button', 'move', '×');
+    remove.title = 'Remove';
+    remove.addEventListener('click', () => saveTeams(teams.filter((t) => t !== team)));
+    li.appendChild(remove);
     list.appendChild(li);
   });
 }
+
+async function addTeam(raw) {
+  const team = String(raw || '').trim();
+  if (!team) return;
+  const teams = settings.teamPriorities || [];
+  if (teams.some((t) => t.toLowerCase() === team.toLowerCase())) return;
+  await saveTeams([...teams, team]);
+  $('teamInput').value = '';
+}
+
+// ------------------------------------------------------------------- panes
+
+function renderPanes(state) {
+  const list = $('panes');
+  list.innerHTML = '';
+  const panes = (state && state.panes) || [];
+  if (!panes.length) {
+    list.appendChild(el('li', 'empty', 'No games detected yet.'));
+    return;
+  }
+  for (const pane of panes) {
+    const li = el('li');
+    li.appendChild(el('span', 'pane-name', pane.label));
+    if (pane.stateText) li.appendChild(tag(pane.stateText));
+    if (pane.inBreak) li.appendChild(tag('break'));
+    else if (!pane.live) li.appendChild(tag('dead'));
+    if (pane.isPrimary) li.appendChild(tag('audio', true));
+    list.appendChild(li);
+  }
+}
+
+// ---------------------------------------------------------- league overview
+
+function startTime(iso) {
+  try {
+    return new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  } catch {
+    return '';
+  }
+}
+
+function renderGames(state) {
+  const list = $('games');
+  list.innerHTML = '';
+  const games = state && state.games;
+  if (!games || (!games.live.length && !games.upcoming.length)) {
+    list.appendChild(el('li', 'empty', games && games.apiError ? 'Stats API unreachable.' : 'No games right now.'));
+    return;
+  }
+  for (const game of games.live) {
+    const li = el('li');
+    li.appendChild(el('span', 'pane-name', game.matchup));
+    li.appendChild(tag(game.state, true));
+    addQuickAdd(li, game.teams);
+    list.appendChild(li);
+  }
+  for (const game of games.upcoming) {
+    const li = el('li');
+    li.appendChild(el('span', 'pane-name offscreen', game.matchup));
+    li.appendChild(tag(startTime(game.startISO)));
+    addQuickAdd(li, game.teams);
+    list.appendChild(li);
+  }
+}
+
+/** One-click "rank this team" buttons next to each league game. */
+function addQuickAdd(li, teams) {
+  const ranked = new Set((settings.teamPriorities || []).map((t) => t.toLowerCase()));
+  for (const team of teams || []) {
+    if (ranked.has(String(team).toLowerCase())) continue;
+    const button = el('button', 'move', `+${team}`);
+    button.title = `Rank ${team}`;
+    button.addEventListener('click', () => addTeam(team));
+    li.appendChild(button);
+  }
+}
+
+// ------------------------------------------------------------------ refresh
 
 async function refresh() {
   if (tabId == null) return;
   const state = await send({ type: 'popupStatus', tabId });
   renderStatus(state);
   renderPanes(state);
+  renderGames(state);
 }
 
 async function setListenMode(on) {
   settings = { ...settings, listenMode: on };
-  await Settings.save(settings);
+  await Settings.save({ listenMode: on });
 
   if (!on) {
     await send({ type: 'stopListening', tabId });
@@ -115,7 +184,7 @@ async function setListenMode(on) {
     $('status').textContent = `capture blocked\n${(error && error.message) || error}`;
     $('listenMode').checked = false;
     settings = { ...settings, listenMode: false };
-    await Settings.save(settings);
+    await Settings.save({ listenMode: false });
     return;
   }
 
@@ -129,7 +198,7 @@ async function setListenMode(on) {
     $('status').textContent = `listen failed\n${(result && result.reason) || 'no response'}`;
     $('listenMode').checked = false;
     settings = { ...settings, listenMode: false };
-    await Settings.save(settings);
+    await Settings.save({ listenMode: false });
   }
 }
 
@@ -139,14 +208,26 @@ async function setListenMode(on) {
   tabId = tab ? tab.id : null;
 
   $('enabled').checked = settings.enabled;
+  $('autoTune').checked = settings.autoTune;
   $('listenMode').checked = settings.listenMode;
+  renderTeams();
 
   $('enabled').addEventListener('change', async () => {
     settings = { ...settings, enabled: $('enabled').checked };
-    await Settings.save(settings);
+    await Settings.save({ enabled: settings.enabled });
+  });
+
+  $('autoTune').addEventListener('change', async () => {
+    settings = { ...settings, autoTune: $('autoTune').checked };
+    await Settings.save({ autoTune: settings.autoTune });
   });
 
   $('listenMode').addEventListener('change', () => setListenMode($('listenMode').checked));
+
+  $('teamAdd').addEventListener('click', () => addTeam($('teamInput').value));
+  $('teamInput').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') addTeam($('teamInput').value);
+  });
 
   $('switchNow').addEventListener('click', async () => {
     const result = await send({ type: 'popupSwitch', tabId });

@@ -25,6 +25,14 @@
     breakText: 'commercial break',
     // Pane keys, best first. Managed from the popup.
     priorities: [],
+    // Team names/abbreviations, best first ("SD", "Padres", ...). Outranks the
+    // per-feed list: a game featuring a ranked team beats any unranked game.
+    teamPriorities: [],
+    // Swap panes showing dead games (final / not started) for live games found
+    // on the rail. The point of knowing every game's state.
+    autoTune: true,
+    // CSS selector for rail game cards, same escape-hatch idea as paneSelector.
+    railSelector: '',
     // Analyse captured tab audio to notice when commentary stops even without a
     // break banner. Costs a tabCapture permission prompt, so it is opt-in.
     listenMode: false,

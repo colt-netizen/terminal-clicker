@@ -1,16 +1,25 @@
 {
   "manifest_version": 3,
   "name": "MLB Multiview Audio Switcher",
-  "version": "0.1.0",
-  "description": "When the audio pane in an MLB.tv multiview goes quiet, promote another pane until sound comes back.",
-  "permissions": ["storage", "tabCapture", "offscreen"],
-  "host_permissions": ["*://*.mlb.com/*"],
+  "version": "0.2.0",
+  "description": "Keeps MLB.tv multiview audio on live baseball: tracks every game's state, follows your team priorities, and swaps dead panes for live games.",
+  "permissions": [
+    "storage",
+    "tabCapture",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "*://*.mlb.com/*",
+    "https://statsapi.mlb.com/*"
+  ],
   "background": {
     "service_worker": "src/background.js"
   },
   "content_scripts": [
     {
-      "matches": ["*://*.mlb.com/*"],
+      "matches": [
+        "*://*.mlb.com/*"
+      ],
       "js": [
         "src/shared/silence-machine.js",
         "src/shared/pane-selector.js",

@@ -3,6 +3,12 @@
 ## Unreleased
 
 ### Added
+- mlb-multiview-switcher 0.2.0: game-state awareness. Tracks every game via
+  MLB's free public stats API plus the page's own game rail ("Bot 8", "Final",
+  start times), ranks games by user team priorities, keeps audio on live
+  baseball only, and auto-tunes panes showing dead games to live ones by
+  driving the rail — with verified attempts and automatic stand-down when rail
+  clicks don't land. No AI, no keys, ~5KB/45s only while an MLB tab is open.
 - `mlb-multiview-switcher/` — a Chromium MV3 extension, independent of the
   Python tooling. Watches an MLB.tv multiview tab and promotes another pane
   when the one carrying audio goes quiet. Detection uses Chrome's per-tab

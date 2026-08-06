@@ -89,6 +89,13 @@
    * game does not). Falls back to position when the page gives us nothing.
    */
   function derivePaneKey(container, index) {
+    // Team logos carry alt text; two of them make a recognisable matchup and
+    // give the worker tokens to match against the stats API's team names.
+    const alts = [...container.querySelectorAll('img[alt]')]
+      .map((img) => img.alt.trim())
+      .filter((alt) => alt && alt.length < 40);
+    const tokens = alts.slice(0, 2);
+
     const idHolder =
       container.querySelector('[data-game-pk],[data-gamepk],[data-game-id]') ||
       container.closest('[data-game-pk],[data-gamepk],[data-game-id]');
@@ -97,22 +104,20 @@
         idHolder.getAttribute('data-game-pk') ||
         idHolder.getAttribute('data-gamepk') ||
         idHolder.getAttribute('data-game-id');
-      if (id) return { key: `game:${id}`, label: `Game ${id}` };
+      if (id) return { key: `game:${id}`, label: `Game ${id}`, tokens };
     }
 
-    // Team logos carry alt text; two of them make a recognisable matchup.
-    const alts = [...container.querySelectorAll('img[alt]')]
-      .map((img) => img.alt.trim())
-      .filter((alt) => alt && alt.length < 40);
     if (alts.length >= 2) {
       const matchup = `${alts[0]} v ${alts[1]}`;
-      return { key: `teams:${matchup.toLowerCase()}`, label: matchup };
+      return { key: `teams:${matchup.toLowerCase()}`, label: matchup, tokens };
     }
 
     const link = container.querySelector('a[href*="gamePk="], a[href*="/gameday/"]');
-    if (link) return { key: `href:${link.getAttribute('href')}`, label: link.textContent.trim() || 'Game' };
+    if (link) {
+      return { key: `href:${link.getAttribute('href')}`, label: link.textContent.trim() || 'Game', tokens };
+    }
 
-    return { key: `pos:${index}`, label: `Pane ${index + 1}` };
+    return { key: `pos:${index}`, label: `Pane ${index + 1}`, tokens };
   }
 
   /** MLB outlines the active pane; class names are the cheapest way to spot it. */
@@ -150,15 +155,79 @@
 
     const pattern = breakPattern();
     return containers.map((pane, index) => {
-      const { key, label } = derivePaneKey(pane.container, index);
+      const { key, label, tokens } = derivePaneKey(pane.container, index);
+      const text = paneText(pane.container);
       return {
         ...pane,
         key,
         label,
-        inBreak: pattern.test(paneText(pane.container)),
+        tokens,
+        text: text.slice(0, 200),
+        inBreak: pattern.test(text),
         active: looksActive(pane.container),
       };
     });
+  }
+
+  // ------------------------------------------------------------- game rail
+  //
+  // The rail across the top of multiview is a row of cards, one per game in
+  // the league, each printing its state ("Bot 8", "Final", "1:20 PM") and two
+  // team abbreviations. It is both a state source and a control surface: the
+  // worker asks us to click a card to load that game into the focused pane.
+
+  const RAIL_STATE = /\b(?:top|bot(?:tom)?|mid(?:dle)?|end)\s*\d{1,2}\b|\bfinal\b|\bppd\b|\bpostponed\b|\bdelay|\bsuspended\b|\bwarmup\b|\b\d{1,2}:\d{2}\s*(?:am|pm)\b/i;
+  const NOT_TEAM_TOKENS = new Set(['AM', 'PM', 'ET', 'PT', 'CT', 'MT', 'TV', 'PPD', 'TBD', 'MLB']);
+
+  function railTokens(text) {
+    return [...String(text).matchAll(/\b[A-Z]{2,3}\b/g)]
+      .map((m) => m[0])
+      .filter((t) => !NOT_TEAM_TOKENS.has(t));
+  }
+
+  /**
+   * Find rail cards: small subtrees whose text is a game state plus two team
+   * abbreviations. textContent (not innerText) keeps this cheap — no layout —
+   * and the innermost-match dedupe drops the ancestors that also match because
+   * they contain a card.
+   */
+  function scanRail() {
+    let candidates = null;
+    if (settings.railSelector) {
+      try {
+        candidates = [...document.querySelectorAll(settings.railSelector)];
+      } catch {
+        candidates = null; // bad selector; fall back to the heuristic
+      }
+    }
+    if (!candidates || !candidates.length) {
+      candidates = [];
+      for (const el of document.querySelectorAll('a, button, li, div')) {
+        const text = (el.textContent || '').trim();
+        if (text.length < 4 || text.length > 60) continue;
+        if (!RAIL_STATE.test(text)) continue;
+        if (railTokens(text).length < 2) continue;
+        candidates.push(el);
+      }
+      // Keep innermost matches only.
+      candidates = candidates.filter((el) => !candidates.some((other) => other !== el && el.contains(other)));
+    }
+
+    return candidates.slice(0, 40).map((el) => {
+      const text = (el.textContent || '').trim().slice(0, 80);
+      return { el, text, tokens: railTokens(text), viewing: /\bviewing\b/i.test(text) };
+    });
+  }
+
+  /** Click the rail card whose team tokens match the worker's request. */
+  function clickRailCard(tokens) {
+    const want = (tokens || []).map((t) => String(t).toUpperCase());
+    if (!want.length) return { ok: false, reason: 'no tokens' };
+    const card = scanRail().find((c) => want.every((t) => c.tokens.includes(t)));
+    if (!card) return { ok: false, reason: 'card not found' };
+    realClick(card.el);
+    lastAction = `rail click: ${card.text}`;
+    return { ok: true, text: card.text };
   }
 
   /**
@@ -285,30 +354,49 @@
       document.documentElement.appendChild(hud);
     }
 
-    const panes = discoverPanes();
     const lines = [
       `phase    ${machine.phase}`,
       `signal   ${info.source}${info.listening ? ` ${info.recentDb}dB / floor ${info.floorDb}dB` : ''}`,
       `audible  ${info.audible}`,
-      `panes    ${info.totalPanes}`,
+      `panes    ${info.totalPanes}   rail ${info.railCards ?? 0} cards   api ${info.apiGames ?? 0} games`,
     ];
-    panes.forEach((p, i) => {
-      const marks = [p.inBreak ? 'BREAK' : 'live', p.video.muted ? '' : 'audio'].filter(Boolean);
-      lines.push(`  ${i + 1}. ${p.label} [${marks.join(' ')}]`);
+    (info.panes || []).forEach((p, i) => {
+      const marks = [
+        p.stateText || '?',
+        p.inBreak ? 'BREAK' : p.live ? 'live' : `dead: ${p.liveReason}`,
+        p.isPrimary ? 'audio' : '',
+      ].filter(Boolean);
+      lines.push(`  ${i + 1}. ${p.label} [${marks.join(' | ')}]`);
     });
+    if (info.tuneTripped) lines.push('tune     PAUSED (rail clicks not landing)');
     lines.push(`last     ${lastAction}`);
     hud.textContent = lines.join('\n');
   }
 
   // ---------------------------------------------------------------- loops
 
+  let reportCount = 0;
+
   async function report() {
     const panes = discoverPanes();
-    await toWorker({
+    const message = {
       type: 'report',
-      panes: panes.map((p) => ({ key: p.key, label: p.label, inBreak: p.inBreak })),
+      panes: panes.map((p) => ({
+        key: p.key,
+        label: p.label,
+        tokens: p.tokens,
+        text: p.text,
+        inBreak: p.inBreak,
+      })),
       primaryLocal: primaryIndex(panes),
-    });
+    };
+    // The rail scan walks a lot of DOM, so run it at a third of the report
+    // rate, and only from the top frame (the rail lives in the main document).
+    if (isCoordinator && reportCount % 3 === 0) {
+      message.rail = scanRail().map((c) => ({ text: c.text, tokens: c.tokens, viewing: c.viewing }));
+    }
+    reportCount += 1;
+    await toWorker(message);
   }
 
   async function tick() {
@@ -356,6 +444,25 @@
     if (msg.type === 'demote') {
       sendResponse(demote());
       return false;
+    }
+    // Auto-tune step 1: focus the pane being given up, without touching audio —
+    // MLB loads rail selections into the focused pane.
+    if (msg.type === 'focusPane') {
+      const pane = discoverPanes()[msg.local];
+      if (!pane) {
+        sendResponse({ ok: false, reason: 'pane index out of range' });
+        return false;
+      }
+      realClick(pane.container);
+      sendResponse({ ok: true });
+      return false;
+    }
+    // Auto-tune step 2: click the target game's rail card. Wait out MLB's
+    // focus handling from step 1 before clicking, or the selection can land in
+    // the wrong pane.
+    if (msg.type === 'clickRail') {
+      setTimeout(() => sendResponse(clickRailCard(msg.tokens)), SETTLE_MS);
+      return true;
     }
     return false;
   });
