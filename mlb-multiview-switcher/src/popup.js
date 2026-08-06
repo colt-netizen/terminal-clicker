@@ -33,6 +33,7 @@ function renderStatus(state) {
     ? `speech ${state.recentDb}dB spread ${state.spreadDb ?? '?'}dB / floor ${state.floorDb}dB`
     : 'tab audio flag';
   const lines = [
+    `build    v${chrome.runtime.getManifest().version}`,
     `panes    ${state.totalPanes}`,
     `playing  ${state.audible}`,
     `signal   ${signal}`,

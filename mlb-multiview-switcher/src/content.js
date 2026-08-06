@@ -496,7 +496,7 @@
     }
 
     const lines = [
-      `phase    ${machine.phase}${info.replayMode ? '   mode replay-night' : ''}`,
+      `v${chrome.runtime.getManifest().version}  phase ${machine.phase}${info.replayMode ? '   mode replay-night' : ''}`,
       `signal   ${info.source}${info.listening ? ` ${info.recentDb}dB spread ${info.spreadDb ?? '?'}dB / floor ${info.floorDb}dB` : ''}`,
       `audible  ${info.audible}`,
       `panes    ${info.totalPanes}   rail ${info.railCards ?? 0} cards   api ${info.apiGames ?? 0} games`,

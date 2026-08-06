@@ -568,11 +568,16 @@ async function evaluate(tabId, { audioDead, blocked }) {
     const probing = sinceSwitch <= PROBE_MS;
     // Track how long the audio pane has demonstrably lacked commentary.
     const heard = speech.get(tabId);
+    const listening = Boolean(heard && now - heard.ts < SPEECH_TTL_MS);
     if (!lastAlive.has(tabId)) lastAlive.set(tabId, now);
-    if (heard && now - heard.ts < SPEECH_TTL_MS && heard.speechPresent) lastAlive.set(tabId, now);
+    if (listening && heard.speechPresent) lastAlive.set(tabId, now);
     const deadStreak = now - lastAlive.get(tabId);
 
-    const badLanding = probing && current && (current.inBreak || audioDead);
+    // A landing is bad if it shows a break, or — when we can hear — stays
+    // speechless for its first seconds (the alive-clock resets on promotion,
+    // so deadStreak here measures silence since landing).
+    const badLanding =
+      probing && current && (current.inBreak || audioDead || (listening && deadStreak >= 5000));
     if (badLanding && current) {
       let heatMap = paneHeat.get(tabId);
       if (!heatMap) {
@@ -589,14 +594,17 @@ async function evaluate(tabId, { audioDead, blocked }) {
       panes: panes.map((p) => (p.key === topKey ? { ...p, cooling: false } : p)),
       priorities,
       currentIndex: currentIndex(tabId, panes),
-      // Dead air alone moves audio only when it has been CONTINUOUS for
-      // DEAD_AIR_ESCAPE_MS and we're past the dwell — a commentary lull during
-      // a play must never eject the user from an active game. A bad landing
-      // (probe window) keeps its fast bail. Definite signals (breaks, dead
-      // games) keep the ordinary cooldown either way.
+      // Dead air escapes come from OUR continuous streak when we can hear —
+      // not from the silence machine's pulses, whose backoff naps were leaving
+      // the audio parked on a slate while a watchable pane sat right there.
+      // The machine only matters in tab-flag mode, where there is no speech
+      // stream to measure. Either way: a commentary lull during a play must
+      // never eject the user (45s continuous requirement), and a bad landing
+      // keeps its fast bail.
       audioDead:
-        audioDead &&
-        (badLanding || (sinceSwitch >= AUDIO_DWELL_MS && deadStreak >= DEAD_AIR_ESCAPE_MS)),
+        badLanding ||
+        ((listening ? deadStreak >= DEAD_AIR_ESCAPE_MS : audioDead) &&
+          sinceSwitch >= AUDIO_DWELL_MS),
       // Escapes always; upgrades only back to THE most important game (the
       // user's click or their designated team) once it is watchable again.
       allowUpgrade: 'top',
