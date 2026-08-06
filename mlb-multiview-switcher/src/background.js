@@ -90,6 +90,13 @@ const DEAD_AIR_ESCAPE_MS = 45000;
  * the audio straight back into the slate.
  */
 const AUDIO_ESCAPE_HEAT_MS = 150000; // avg MLB ad pod (2:15-2:45) with margin
+// A pane escaped for silence AGAIN without ever producing speech in between is
+// not on an ad break — it is dead (a replay sitting past its end, a stalled
+// feed). Each consecutive strike doubles the heat, so the return-and-confirm
+// cycle backs off instead of burning 15 dead seconds every 150s forever.
+const AUDIO_ESCAPE_HEAT_MAX_MS = 20 * 60 * 1000;
+/** tabId -> Map<paneKey, consecutive silence-escapes with no speech between>. */
+const escapeStrikes = new Map();
 /**
  * A user clicking AWAY from a pane is the strongest break detector in the
  * system: they are looking at it. The abandoned pane is toxic waste for the
@@ -889,7 +896,13 @@ async function evaluate(tabId, { audioDead, blocked }) {
     if (!lastAlive.has(tabId)) lastAlive.set(tabId, now);
     if (listening && heard.speechPresent) {
       lastAlive.set(tabId, now);
-      if (current) feedSpeechEvidence(tabId, current, now);
+      if (current) {
+        feedSpeechEvidence(tabId, current, now);
+        // Confirmed speech clears the pane's silence-escape strikes: it is a
+        // real broadcast again, so future escapes restart at one ad pod.
+        const strikes = escapeStrikes.get(tabId);
+        if (strikes) strikes.delete(current.key);
+      }
     }
     const deadStreak = now - lastAlive.get(tabId);
     if (listening) {
@@ -915,8 +928,16 @@ async function evaluate(tabId, { audioDead, blocked }) {
     const decision = Selector.choose({
       // The most important pane is exempt from cooling: when its ad genuinely
       // ends (the episode model guarantees that took ad-pod time), the audio
-      // returns without serving a second sentence.
-      panes: panes.map((p) => (p.key === topKey ? { ...p, cooling: false } : p)),
+      // returns without serving a second sentence. The user's HELD pane is
+      // additionally exempt from the "game is final" escape — a replay being
+      // watched by choice is never not-live enough to leave; only a break or
+      // dead air moves the audio off it.
+      panes: panes.map((p) => {
+        let q = p;
+        if (q.key === topKey) q = { ...q, cooling: false };
+        if (heldKey && q.key === heldKey) q = { ...q, notLive: false };
+        return q;
+      }),
       priorities,
       currentIndex: currentIndex(tabId, panes),
       // Dead air escapes come from OUR commentary-confidence EMA when we can
@@ -973,7 +994,17 @@ async function evaluate(tabId, { audioDead, blocked }) {
           heatMap = new Map();
           paneHeat.set(tabId, heatMap);
         }
-        heatMap.set(departed.key, now + AUDIO_ESCAPE_HEAT_MS);
+        let strikes = escapeStrikes.get(tabId);
+        if (!strikes) {
+          strikes = new Map();
+          escapeStrikes.set(tabId, strikes);
+        }
+        const count = (strikes.get(departed.key) || 0) + 1;
+        strikes.set(departed.key, count);
+        heatMap.set(
+          departed.key,
+          now + Math.min(AUDIO_ESCAPE_HEAT_MS * 2 ** (count - 1), AUDIO_ESCAPE_HEAT_MAX_MS)
+        );
         feedBreakDetection(tabId, departed);
       }
       // A break-banner escape is also a confirmed break at a known position.
@@ -1342,6 +1373,7 @@ function softReset(tabId) {
   alignments.delete(tabId);
   panePos.delete(tabId);
   userLockUntil.delete(tabId);
+  escapeStrikes.delete(tabId);
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -1361,5 +1393,6 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   lastTune.delete(tabId);
   tuneStrikes.delete(tabId);
   tuneTripped.delete(tabId);
+  escapeStrikes.delete(tabId);
   if (speech.has(tabId)) stopListening(tabId);
 });

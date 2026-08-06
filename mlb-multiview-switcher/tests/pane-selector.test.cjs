@@ -408,6 +408,37 @@ test('once heat expires the top pane may reclaim the audio', () => {
   assert.strictEqual(result.index, 0);
 });
 
+test('an upgrade never fires into a heated pane, even when everything is heated', () => {
+  // When every pane is heated the escape fallback keeps them selectable
+  // ("better one than none") — but an upgrade is optional, and the flight
+  // recorder showed the return-to-top rule using exactly that fallback to
+  // dive back into the dead favourite the moment nothing better existed.
+  const result = choose({
+    panes: [
+      { key: 'held', heated: true },
+      { key: 'other', heated: true },
+    ],
+    priorities: ['held', 'other'],
+    currentIndex: 1,
+    audioDead: false,
+    allowUpgrade: 'top',
+  });
+  assert.strictEqual(result, null, 'all-heated fallback must not enable upgrades');
+});
+
+test('escapes may still use a heated destination when everything is heated', () => {
+  const result = choose({
+    panes: [
+      { key: 'a', inBreak: true, heated: true },
+      { key: 'b', heated: true },
+    ],
+    priorities: [],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result.index, 1, 'a break always escapes, heat or not');
+});
+
 test('heated panes are skipped as escape destinations when others exist', () => {
   const result = choose({
     panes: [pane('a', true), { key: 'b', heated: true }, pane('c')],
