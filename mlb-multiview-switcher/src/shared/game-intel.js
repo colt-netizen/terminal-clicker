@@ -134,9 +134,15 @@
 
   /**
    * Find the schedule game a set of tokens (pane logo alts, rail abbrs) refers
-   * to. Requires every provided token to land on the same game, and at least
-   * one token; two-token matches are unambiguous, one-token matches are only
-   * accepted when exactly one candidate game contains that team.
+   * to.
+   *
+   * Two ambiguity problems live here. Tokens like "Chicago" name two
+   * franchises — those must refuse to match. And the schedule window spans
+   * yesterday..tomorrow, so mid-series the same matchup appears two or three
+   * times; a pane showing today's live game must not match yesterday's final.
+   * So: tokens must identify a single set of franchises, and among that
+   * matchup's games the one actually being played wins, then the next to
+   * start, then the most recent final.
    */
   function matchGame(games, tokens) {
     const clean = (tokens || []).map(normalizeToken).filter(Boolean);
@@ -146,9 +152,53 @@
       const teams = gameTeams(game);
       return clean.every((token) => teams.some((team) => tokenMatchesTeam(token, team)));
     });
-    if (hits.length === 1) return hits[0];
-    if (hits.length > 1 && clean.length >= 2) return hits[0];
-    return null;
+    if (!hits.length) return null;
+
+    // Every token must resolve to exactly one franchise across the hits —
+    // otherwise "Chicago" would happily claim both the Cubs and the White Sox.
+    for (const token of clean) {
+      const franchises = new Set();
+      for (const game of hits) {
+        for (const team of gameTeams(game)) {
+          if (tokenMatchesTeam(token, team)) franchises.add(normalizeToken(team.abbreviation));
+        }
+      }
+      if (franchises.size > 1) return null;
+    }
+
+    // Series preference: playing now > starting next > most recently finished.
+    return (
+      hits.find((g) => {
+        const kind = classifyApiGame(g);
+        return kind === 'live' || kind === 'paused';
+      }) ||
+      hits.find((g) => classifyApiGame(g) === 'preview') ||
+      hits[hits.length - 1]
+    );
+  }
+
+  /**
+   * Match a pane to a game from its visible text — the scorebug ("SF 0 TEX 0"),
+   * a graphic ("REDS BULLPEN"). Finds which franchises the text mentions; one
+   * or two distinct franchises resolve through matchGame, anything else (a
+   * ticker naming half the league, a press conference naming nobody) is null.
+   */
+  function matchGameByText(games, text) {
+    const words = String(text || '').match(/[A-Za-z][A-Za-z-]{1,15}/g) || [];
+    if (!words.length) return null;
+    const tokens = new Set(words.map(normalizeToken));
+
+    const franchises = new Map(); // abbr -> a token that named it
+    for (const game of games || []) {
+      for (const team of gameTeams(game)) {
+        const abbr = normalizeToken(team.abbreviation);
+        if (franchises.has(abbr)) continue;
+        const alias = teamAliases(team).find((a) => tokens.has(a));
+        if (alias) franchises.set(abbr, alias);
+      }
+    }
+    if (franchises.size === 0 || franchises.size > 2) return null;
+    return matchGame(games, [...franchises.keys()]);
   }
 
   /** Match by gamePk when the pane key carries one ("game:824158"). */
@@ -250,9 +300,12 @@
    * give up, or null.
    */
   function pickTuneTarget({ panes, games, railCards, teamPriorities, skipGamePks }) {
+    // Only truly dead panes are up for replacement. A commercial break is NOT
+    // dead — that game is about to come back, and replacing (or even focusing)
+    // its pane is exactly the "it clicked into the break window" bug.
     const deadPanes = (panes || [])
       .map((pane, index) => ({ pane, index }))
-      .filter(({ pane }) => !pane.live);
+      .filter(({ pane }) => !pane.live && !pane.inBreak);
     if (!deadPanes.length) return null;
 
     const onScreen = new Set(
@@ -260,12 +313,23 @@
     );
     const skip = new Set(skipGamePks || []);
 
+    /**
+     * A card is clickable for a game only if its own printed state agrees the
+     * game is on ("Bot 3", or unparseable text we defer to the API on). This
+     * is what disambiguates doubleheaders: both cards carry the same team
+     * tokens, but only one says an inning while the other says Final.
+     */
+    const cardShowsPlayable = (c) => {
+      const kind = parseRailState(c.text || '').kind;
+      return kind === 'live' || kind === 'unknown';
+    };
+
     const candidates = (games || [])
       .filter((g) => classifyApiGame(g) === 'live')
       .filter((g) => !onScreen.has(g.gamePk) && !skip.has(g.gamePk))
       .map((g) => {
         const card = (railCards || []).findIndex(
-          (c) => !c.viewing && matchGame([g], c.tokens || []) === g
+          (c) => !c.viewing && cardShowsPlayable(c) && matchGame([g], c.tokens || []) === g
         );
         return { game: g, cardIndex: card, rank: teamRankOfGame(g, teamPriorities) };
       })
@@ -275,9 +339,15 @@
     candidates.sort((a, b) => a.rank - b.rank || a.game.gamePk - b.game.gamePk);
     const best = candidates[0];
 
-    // Give up the worst dead pane: unranked before ranked, then later display
-    // positions first, so the favourite's pane is the last one sacrificed.
-    deadPanes.sort((a, b) => (b.pane.rank ?? 0) - (a.pane.rank ?? 0) || b.index - a.index);
+    // Give up the least-loved dead pane (by the user's team priorities), and
+    // among equals the later display position — the favourite's pane is the
+    // last one sacrificed.
+    const paneRank = ({ pane }) =>
+      teamRankOfGame(
+        (games || []).find((g) => g.gamePk === pane.gamePk),
+        teamPriorities
+      );
+    deadPanes.sort((a, b) => paneRank(b) - paneRank(a) || b.index - a.index);
 
     return {
       gamePk: best.game.gamePk,
@@ -295,6 +365,7 @@
     teamAliases,
     tokenMatchesTeam,
     matchGame,
+    matchGameByText,
     matchByKey,
     teamRankOfGame,
     orderKeys,

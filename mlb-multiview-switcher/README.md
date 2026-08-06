@@ -125,21 +125,35 @@ Capturing a tab mutes it unless the stream is played back, so the audio graph
 forks — one branch to the analyser, one straight to your speakers. Any error
 tears the capture down, which restores normal audio.
 
-## Promoting a pane
+## Moving the audio: enforcement, not requests
 
-Three layers, applied in order, because MLB's DOM is not a stable contract:
+Early versions asked MLB to move its focus (synthetic clicks) and then set the
+mute flags once. That produced an audible ping-pong: MLB's player re-asserts
+its own audio state after external writes — its focus never actually moved —
+so the extension would mute the break pane, MLB would unmute it, the extension
+would switch away again, forever.
 
-1. Click the pane's own audio control, if one is discoverable by `aria-label` /
-   `title`. Going through the page's UI keeps MLB's state consistent.
-2. Failing that, dispatch a full pointer + mouse click sequence at the pane's
-   centre, aimed at whatever `elementFromPoint` says is on top.
-3. Then, regardless, assert the result directly on the media elements
-   (`muted` / `volume` / `play()`), carrying the outgoing pane's volume level
-   over so it doesn't jump to full blast.
+So the audio is now **enforced, not requested**: every 400ms, in every frame,
+the desired state is re-asserted — target pane unmuted, everything else muted,
+writes only on mismatch. MLB can re-assert whenever it likes; it loses within
+half a second. No synthetic clicks exist anywhere in the audio path (they
+remain only in auto-tune, where driving the rail requires them).
 
-Layer 3 is the backstop that makes this work even when layers 1–2 match nothing.
-Its one cosmetic cost: MLB's UI may briefly label a different pane as "active"
-than the one the sound is coming from.
+Two corollaries:
+
+- **Your clicks win instantly.** A real (`isTrusted`) click on a pane becomes
+  the enforced target immediately and is *held*: the switcher leaves it only
+  for a break or when its game dies, returns to it afterwards, and never
+  bounces off it because something else "ranks higher".
+- **Auto-discovered pane order is not a ranking.** Only your ranked teams and
+  your clicks count as preferences. With nothing configured, the switcher
+  moves only when it must (break, dead game, dead air) — never because pane 1
+  was discovered before pane 2.
+
+On promotion to a game the API says is live, the feed is snapped to its live
+edge (and played if paused). Never for finals — a replay position is a choice.
+The one cosmetic cost of enforcement: MLB's white "active pane" outline may
+disagree with where the sound is coming from.
 
 ## Settings
 

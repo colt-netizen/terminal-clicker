@@ -78,6 +78,7 @@ chrome.storage.onChanged.addListener((_changes, areaName) => {
   // Toggling settings is the user's "try again" gesture for auto-tune.
   tuneTripped.clear();
   tuneFailures.clear();
+  tuneStrikes.clear();
 });
 
 // ------------------------------------------------------------- schedule cache
@@ -160,27 +161,56 @@ function liveFrames(tabId, now) {
 /**
  * Flatten every frame's panes into one addressable list, then attach what we
  * know about each pane's game: which game it is, whether baseball is being
- * played on it, and how the user ranks it.
+ * played on it, and how the user's team priorities rank it.
+ *
+ * Matching tries, in order: an explicit gamePk in the pane key; team logo
+ * alts; the pane's own visible text (the scorebug "SF 0 TEX 0", a graphic
+ * naming a team). If none of that lands and the stats API is down, the rail's
+ * printed state fills in via matching card tokens.
  */
-function paneList(tabId, now) {
+function paneList(tabId, now, teamPriorities) {
   const games = scheduleGames();
+  const rail = rails.get(tabId);
+  const cards = rail && now - rail.ts <= FRAME_TTL_MS ? rail.cards : [];
+  // If the API is fresh and reports no baseball anywhere, every pane is dead —
+  // postgame shows, replays and pressers included — no matching required.
+  const leagueDead =
+    schedule.fetchedAt > 0 &&
+    games.length > 0 &&
+    !games.some((g) => ['live', 'paused'].includes(Intel.classifyApiGame(g)));
+
   const out = [];
   for (const frame of liveFrames(tabId, now)) {
     (frame.panes || []).forEach((pane, local) => {
+      const tokens = pane.tokens && pane.tokens.length ? pane.tokens : Intel.tokensFromKey(pane.key);
       const game =
         Intel.matchByKey(games, pane.key) ||
-        Intel.matchGame(games, pane.tokens && pane.tokens.length ? pane.tokens : Intel.tokensFromKey(pane.key));
-      const liveness = Intel.paneLiveness(pane, game);
+        Intel.matchGame(games, tokens) ||
+        Intel.matchGameByText(games, pane.text);
+
+      let railState = null;
+      if (!game && tokens.length) {
+        const mine = new Set(tokens.map(Intel.normalizeToken));
+        const card = cards.find((c) => (c.tokens || []).filter((t) => mine.has(Intel.normalizeToken(t))).length >= 2);
+        if (card) railState = Intel.parseRailState(card.text);
+      }
+
+      let liveness = Intel.paneLiveness({ ...pane, railState }, game);
+      if (liveness.live && leagueDead) {
+        liveness = { live: false, reason: 'no live MLB games right now' };
+      }
       out.push({
         frameId: frame.frameId,
         local,
         key: pane.key,
         label: pane.label,
-        tokens: pane.tokens || [],
+        tokens: tokens || [],
         inBreak: Boolean(pane.inBreak),
         isPrimary: frame.primaryLocal === local,
         gamePk: game ? game.gamePk : null,
-        stateText: game ? Intel.describeApiGame(game) : '',
+        gameLive: game ? Intel.classifyApiGame(game) === 'live' : false,
+        stateText: game ? Intel.describeApiGame(game) : railState ? railState.kind : '',
+        teamRank: Intel.teamRankOfGame(game, teamPriorities || []),
         live: liveness.live,
         liveReason: liveness.reason,
         // For the selector: dead-but-not-break panes are ineligible with a
@@ -223,25 +253,42 @@ function audioState(tabId, tabInfo, now) {
   return { ...tabInfo, source: 'tab-flag', listening: false };
 }
 
-/** Where the audio is right now: what the page reports, else where we put it. */
+/**
+ * Where the audio is right now. Our cursor is authoritative — the content
+ * script *enforces* it on a timer, so MLB's transient re-asserts (which used
+ * to flip the detected primary back to its own focused pane between our
+ * writes) don't get to redefine reality. Detection only seeds a fresh worker.
+ */
 function currentIndex(tabId, panes) {
-  const detected = panes.findIndex((p) => p.isPrimary);
-  if (detected >= 0) return detected;
   const remembered = cursor.has(tabId) ? cursor.get(tabId) : -1;
-  return remembered < panes.length ? remembered : -1;
+  if (remembered >= 0 && remembered < panes.length) return remembered;
+  return panes.findIndex((p) => p.isPrimary);
 }
 
+/**
+ * tabId -> {key} — the pane the user personally clicked. A human choice
+ * outranks everything except that pane's game dying: we leave for breaks and
+ * come back HERE, and we never bounce off it because some other pane "ranks
+ * higher". Cleared when the held pane's game is no longer live, or replaced by
+ * the next user click.
+ */
+const manualHold = new Map();
+
 /** Move the audio to a specific pane. */
-async function promoteIndex(tabId, panes, index) {
+async function promoteIndex(tabId, panes, index, options) {
   const target = panes[index];
   if (!target) return { ok: false, reason: 'pane index out of range' };
   cursor.set(tabId, index);
   lastSwitch.set(tabId, Date.now());
 
+  const goLive = options && 'goLive' in options ? options.goLive : Boolean(target.gameLive);
   const sends = liveFrames(tabId, Date.now()).map((frame) => {
     const message =
       frame.frameId === target.frameId
-        ? { type: 'promote', local: target.local }
+        ? // goLive: for a game the API says is in progress, snap the feed to
+          // the live edge on arrival. Never for finals — that's someone's
+          // replay position.
+          { type: 'promote', local: target.local, goLive }
         : { type: 'demote' };
     return chrome.tabs
       .sendMessage(tabId, message, { frameId: frame.frameId })
@@ -310,13 +357,9 @@ async function maybeTune(tabId, panes, settings, now) {
   }
 
   const target = Intel.pickTuneTarget({
-    panes: panes.map((p) => ({
-      live: p.live,
-      gamePk: p.gamePk,
-      rank: Selector.rankOf(p.key, settings.priorities),
-    })),
+    panes: panes.map((p) => ({ live: p.live, inBreak: p.inBreak, gamePk: p.gamePk })),
     games: scheduleGames(),
-    railCards: rail.cards.map((c) => ({ tokens: c.tokens, viewing: c.viewing })),
+    railCards: rail.cards.map((c) => ({ tokens: c.tokens, viewing: c.viewing, text: c.text })),
     teamPriorities: settings.teamPriorities,
     skipGamePks: skip,
   });
@@ -351,31 +394,32 @@ async function maybeTune(tabId, panes, settings, now) {
  */
 async function evaluate(tabId, { audioDead, blocked }) {
   const now = Date.now();
-  const panes = paneList(tabId, now);
+  const settings = await currentSettings();
+  const panes = paneList(tabId, now, settings.teamPriorities);
   settlePendingTune(tabId, panes, now);
 
   if (blocked || panes.length < 2) return { switched: false };
-
-  const settings = await currentSettings();
   if (!settings.enabled) return { switched: false };
 
-  const feedPriorities = Selector.mergePriorities(
-    settings.priorities,
-    panes.map((p) => p.key)
-  );
-  // Persist newly seen games so they show up in the popup's priority list.
-  if (feedPriorities.length !== (settings.priorities || []).length) {
-    settingsCache = { ...settings, priorities: feedPriorities };
-    await Settings.save({ priorities: feedPriorities });
+  // The user's click is the strongest ranking there is. It holds until that
+  // pane's game stops being live baseball, then normal rules resume.
+  let heldKey = null;
+  const hold = manualHold.get(tabId);
+  if (hold) {
+    const held = panes.find((p) => p.key === hold.key);
+    if (!held || held.notLive) manualHold.delete(tabId);
+    else heldKey = hold.key;
   }
 
-  // Teams outrank the manual feed order; with no team priorities set this is
-  // exactly the manual order.
-  const priorities = Intel.orderKeys(panes, {
-    games: scheduleGames(),
-    teamPriorities: settings.teamPriorities,
-    feedPriorities,
-  });
+  // Only *explicit* preferences rank: the held pane, then panes featuring the
+  // user's ranked teams. Everything else is deliberately unranked — auto-
+  // discovered display order is NOT a preference, and treating it as one is
+  // what glued the audio to the top-left pane and fought the user's clicks.
+  const teamRanked = panes
+    .filter((p) => p.teamRank !== Number.MAX_SAFE_INTEGER && p.key !== heldKey)
+    .sort((a, b) => a.teamRank - b.teamRank)
+    .map((p) => p.key);
+  const priorities = heldKey ? [heldKey, ...teamRanked] : teamRanked;
 
   let switched = { switched: false };
   if (now - (lastSwitch.get(tabId) || 0) >= SWITCH_COOLDOWN_MS) {
@@ -398,10 +442,25 @@ async function evaluate(tabId, { audioDead, blocked }) {
 
 /** Manual "switch now": step to the next pane regardless of state. */
 async function rotate(tabId) {
-  const panes = paneList(tabId, Date.now());
+  const settings = await currentSettings();
+  const panes = paneList(tabId, Date.now(), settings.teamPriorities);
   if (panes.length < 2) return { ok: false, reason: 'need at least two panes' };
   const from = currentIndex(tabId, panes);
-  return promoteIndex(tabId, panes, (from + 1) % panes.length);
+  const to = (from + 1) % panes.length;
+  // Explicit user action — hold the destination like a direct click.
+  manualHold.set(tabId, { key: panes[to].key });
+  return promoteIndex(tabId, panes, to);
+}
+
+/** The user physically clicked a pane: adopt it, hold it, and reconcile every
+ * frame's enforcement to it. No goLive snap — clicking to look at a pane is
+ * not a request to lose your place in it. */
+async function userSelect(tabId, frameId, local) {
+  const panes = paneList(tabId, Date.now(), []);
+  const index = panes.findIndex((p) => p.frameId === frameId && p.local === local);
+  if (index === -1) return;
+  manualHold.set(tabId, { key: panes[index].key });
+  await promoteIndex(tabId, panes, index, { goLive: false });
 }
 
 // ------------------------------------------------------------- listen mode
@@ -506,13 +565,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    // A real (isTrusted) click landed on a pane.
+    case 'userSelect': {
+      if (tabId == null) return false;
+      userSelect(tabId, sender.frameId ?? 0, msg.local);
+      return false;
+    }
+
     // The coordinator frame's tick.
     case 'getState': {
       if (tabId == null) return false;
       if (msg.status) status.set(tabId, { ...msg.status, ts: Date.now() });
-      tabAudio(tabId).then((info) => {
+      Promise.all([tabAudio(tabId), currentSettings()]).then(([info, settings]) => {
         const now = Date.now();
-        const panes = paneList(tabId, now);
+        const panes = paneList(tabId, now, settings.teamPriorities);
         const rail = rails.get(tabId);
         sendResponse({
           ...audioState(tabId, info, now),
@@ -572,10 +638,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case 'popupStatus': {
-      tabAudio(msg.tabId).then((info) => {
+      Promise.all([tabAudio(msg.tabId), currentSettings()]).then(([info, settings]) => {
         const now = Date.now();
         const known = status.get(msg.tabId);
-        const panes = paneList(msg.tabId, now);
+        const panes = paneList(msg.tabId, now, settings.teamPriorities);
         sendResponse({
           ...audioState(msg.tabId, info, now),
           totalPanes: panes.length,
@@ -606,6 +672,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   rails.delete(tabId);
   status.delete(tabId);
   cursor.delete(tabId);
+  manualHold.delete(tabId);
   lastSwitch.delete(tabId);
   pendingTune.delete(tabId);
   lastTune.delete(tabId);

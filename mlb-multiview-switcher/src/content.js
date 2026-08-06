@@ -263,63 +263,82 @@
     return true;
   }
 
-  const AUDIO_CONTROL = /\b(unmute|mute|audio|sound|volume|listen)\b/i;
-
   /**
-   * Prefer the pane's own audio control when there is one — going through the
-   * page's UI keeps MLB's state in sync with reality.
+   * Which pane should carry audio in THIS frame, as far as the worker has told
+   * us. undefined = never instructed (leave the page alone), -1 = mute all
+   * (another frame has the audio), n = pane n has it.
+   *
+   * This exists because one-shot mute writes do not survive: MLB's player
+   * re-asserts its own audio state after our changes (its focus never moved —
+   * synthetic clicks don't convince it), which produced an audible ping-pong:
+   * we mute the break pane, MLB unmutes it, we switch away again, forever. So
+   * instead of asking MLB and hoping, the desired state is *enforced* on a
+   * timer: MLB can re-assert whenever it likes and loses within half a second.
    */
-  function clickAudioControl(pane) {
-    const controls = pane.container.querySelectorAll('button, [role="button"], [aria-label], [title]');
-    for (const control of controls) {
-      const label = `${control.getAttribute('aria-label') || ''} ${control.getAttribute('title') || ''}`;
-      if (AUDIO_CONTROL.test(label)) return realClick(control);
-    }
-    return false;
-  }
+  let desired;
 
-  /**
-   * Assert the outcome directly on the media elements. This is the backstop
-   * that makes the feature work even if none of the DOM heuristics match the
-   * page — MLB's UI may briefly disagree about which pane is labelled active,
-   * but the sound lands where we asked for it.
-   */
-  function applyAudio(panes, index) {
-    // Carry the outgoing pane's level over rather than jumping to full volume.
-    const outgoing = panes.find((p, i) => i !== index && !p.video.muted && p.video.volume > 0);
-    const level = outgoing ? outgoing.video.volume : 1;
-
-    panes.forEach((pane, i) => {
-      const { video } = pane;
-      if (i === index) {
-        video.muted = false;
-        if (video.volume === 0) video.volume = level;
-        if (video.paused) video.play().catch(() => {});
-      } else {
-        video.muted = true;
-      }
+  /** The bare video elements, without the text/identity work — cheap enough
+   * to call several times a second from the enforcement loop. */
+  function paneVideos() {
+    return [...document.querySelectorAll('video')].filter((v) => {
+      const r = v.getBoundingClientRect();
+      return r.width >= MIN_PANE_WIDTH && r.height >= MIN_PANE_HEIGHT;
     });
   }
 
-  async function promote(local) {
+  /** Re-assert the desired audio state. Writes only on mismatch. */
+  function enforceAudio() {
+    if (desired === undefined) return;
+    const videos = paneVideos();
+    videos.forEach((video, i) => {
+      const shouldMute = desired === -1 || i !== desired;
+      if (video.muted !== shouldMute) video.muted = shouldMute;
+      if (!shouldMute && video.volume === 0) video.volume = 1;
+    });
+  }
+
+  /** Jump a live feed to its live edge (a few seconds back from the boundary
+   * so the player has buffer to stand on). Only called for games the API says
+   * are in progress — never for finals, where the position is someone's
+   * deliberate replay spot. */
+  function seekToLiveEdge(video) {
+    try {
+      const s = video.seekable;
+      if (!s || !s.length) return;
+      const end = s.end(s.length - 1);
+      if (Number.isFinite(end) && end - video.currentTime > 12) {
+        video.currentTime = Math.max(0, end - 4);
+      }
+    } catch {
+      // Some players refuse external seeks; the audio still switched.
+    }
+  }
+
+  async function promote(local, goLive) {
     const panes = discoverPanes();
     const pane = panes[local];
     if (!pane) return { ok: false, reason: 'pane index out of range' };
 
-    if (!clickAudioControl(pane)) realClick(pane.container);
-
-    // The click may have caused MLB to re-lay-out (and re-create) the players,
-    // so re-discover before asserting anything.
-    await sleep(SETTLE_MS);
-    const after = discoverPanes();
-    if (after.length) applyAudio(after, Math.min(local, after.length - 1));
+    desired = local;
+    enforceAudio();
+    if (pane.video.paused) pane.video.play().catch(() => {});
+    if (goLive) {
+      // Let the unmute settle, then snap to now.
+      await sleep(SETTLE_MS);
+      const current = discoverPanes()[local];
+      if (current) {
+        if (current.video.paused) current.video.play().catch(() => {});
+        seekToLiveEdge(current.video);
+      }
+    }
 
     lastAction = `promoted ${pane.label}`;
     return { ok: true, label: pane.label };
   }
 
   function demote() {
-    for (const pane of discoverPanes()) pane.video.muted = true;
+    desired = -1;
+    enforceAudio();
     return { ok: true };
   }
 
@@ -438,7 +457,7 @@
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'promote') {
-      promote(msg.local).then(sendResponse);
+      promote(msg.local, msg.goLive).then(sendResponse);
       return true;
     }
     if (msg.type === 'demote') {
@@ -472,8 +491,27 @@
     Settings.onChange((next) => {
       settings = next;
     });
+
+    // A real user click on a pane is the strongest signal there is: adopt it
+    // as the enforced audio target immediately (before the worker even hears
+    // about it) and tell the worker so it holds the choice. isTrusted filters
+    // out our own synthetic clicks.
+    document.addEventListener(
+      'pointerdown',
+      (event) => {
+        if (!event.isTrusted) return;
+        const panes = discoverPanes();
+        const index = panes.findIndex((p) => p.container.contains(event.target));
+        if (index === -1) return;
+        desired = index;
+        toWorker({ type: 'userSelect', local: index });
+      },
+      true
+    );
+
     setInterval(report, REPORT_MS);
     report();
+    setInterval(enforceAudio, 400);
     if (isCoordinator) setInterval(tick, TICK_MS);
   })();
 })();

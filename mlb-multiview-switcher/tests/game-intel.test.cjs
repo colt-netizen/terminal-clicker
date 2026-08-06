@@ -267,14 +267,50 @@ test('team priorities pick between multiple off-screen live games', () => {
 test('sacrifices the least-favourite dead pane, not the favourite', () => {
   const target = Intel.pickTuneTarget({
     panes: [
-      { live: false, gamePk: 2, rank: 0 }, // favourite, currently final
-      { live: false, gamePk: 3, rank: 5 }, // low priority, not started
+      { live: false, gamePk: 2 }, // Dodgers game — the ranked team's pane
+      { live: false, gamePk: 3 }, // unranked, not started
+    ],
+    games: GAMES,
+    railCards: [rail(['LAA', 'BAL'])],
+    teamPriorities: ['Dodgers'],
+  });
+  assert.strictEqual(target.replaceIndex, 1);
+});
+
+test('a pane on a commercial break is never tune bait', () => {
+  // The reported bug: the tuner counted "in break" as dead, then physically
+  // clicked that pane to focus it — right into the user's commercial window.
+  const target = Intel.pickTuneTarget({
+    panes: [
+      { live: false, inBreak: true, gamePk: 1 }, // break — coming back, hands off
+      { live: true, gamePk: 4 },
     ],
     games: GAMES,
     railCards: [rail(['LAA', 'BAL'])],
     teamPriorities: [],
   });
-  assert.strictEqual(target.replaceIndex, 1);
+  assert.strictEqual(target, null);
+});
+
+test('doubleheader: only the card whose printed state is live gets clicked', () => {
+  const NYY = team('NYY', 'Yankees', 'New York');
+  const BOS = team('BOS', 'Red Sox', 'Boston');
+  const games = [
+    ...GAMES,
+    game(10, NYY, BOS, FINAL), // game 1 of the doubleheader, over
+    game(11, NYY, BOS, LIVE, { currentInning: 3, inningHalf: 'Bottom' }),
+  ];
+  const target = Intel.pickTuneTarget({
+    panes: [{ live: false, gamePk: 2 }, { live: true, gamePk: 1 }],
+    games,
+    railCards: [
+      { tokens: ['NYY', 'BOS'], viewing: false, text: 'Final NYY BOS' },
+      { tokens: ['NYY', 'BOS'], viewing: false, text: 'Bot 3 NYY BOS' },
+    ],
+    teamPriorities: [],
+  });
+  assert.strictEqual(target.gamePk, 11);
+  assert.strictEqual(target.cardIndex, 1, 'the Final card must not be clicked');
 });
 
 test('no rail card for the candidate means no tune', () => {
@@ -308,4 +344,52 @@ test('describeApiGame prefers Middle/End over the inning half', () => {
   const mid = game(7, SD, AZ, LIVE, { currentInning: 5, inningHalf: 'Bottom', inningState: 'Middle' });
   assert.strictEqual(Intel.describeApiGame(mid), 'Mid 5');
   assert.strictEqual(Intel.describeApiGame(GAMES[0]), 'Bot 8');
+});
+
+// --- series ambiguity: the same matchup appears 2-3x in a 3-day window ---
+
+const SD_AZ_SERIES = [
+  game(100, SD, AZ, { abstractGameState: 'Final', detailedState: 'Final' }), // yesterday
+  game(101, SD, AZ, LIVE, { currentInning: 8, inningHalf: 'Bottom' }), // now
+  game(102, SD, AZ, PREVIEW), // tomorrow
+];
+
+test('mid-series, tokens resolve to the game being played, not yesterday\'s final', () => {
+  assert.strictEqual(Intel.matchGame(SD_AZ_SERIES, ['SD', 'AZ']).gamePk, 101);
+  assert.strictEqual(Intel.matchGame(SD_AZ_SERIES, ['Padres']).gamePk, 101);
+});
+
+test('with no live game in the series, the next to start wins, then the latest final', () => {
+  const noLive = [SD_AZ_SERIES[0], SD_AZ_SERIES[2]];
+  assert.strictEqual(Intel.matchGame(noLive, ['SD', 'AZ']).gamePk, 102);
+  const allFinal = [
+    game(100, SD, AZ, { abstractGameState: 'Final', detailedState: 'Final' }),
+    game(103, SD, AZ, { abstractGameState: 'Final', detailedState: 'Final' }),
+  ];
+  assert.strictEqual(Intel.matchGame(allFinal, ['SD', 'AZ']).gamePk, 103);
+});
+
+// --- matching a pane from its visible text ---
+
+test('a scorebug matches its game', () => {
+  assert.strictEqual(Intel.matchGameByText(GAMES, 'SF 0 TEX 0 CHANGEUP 84 MPH'), GAMES[2]);
+});
+
+test('a graphic naming one team matches when the team is unambiguous', () => {
+  const CIN = team('CIN', 'Reds', 'Cincinnati');
+  const ATH = team('ATH', 'Athletics', 'Sacramento');
+  const games = [...GAMES, game(20, ATH, CIN, LIVE, { currentInning: 6, inningHalf: 'Top' })];
+  assert.strictEqual(Intel.matchGameByText(games, 'KEY INGREDIENTS REDS BULLPEN ERA 3.75').gamePk, 20);
+});
+
+test('text naming too many teams, or none, matches nothing', () => {
+  assert.strictEqual(Intel.matchGameByText(GAMES, 'Padres Cubs Rangers roundup tonight'), null);
+  assert.strictEqual(Intel.matchGameByText(GAMES, 'PROGRESSIVE FIELD press conference'), null);
+  assert.strictEqual(Intel.matchGameByText(GAMES, ''), null);
+});
+
+test('the bare LA in a scorebug does not hijack matching', () => {
+  // "LA 1 CHC 0" — LA is ambiguous (Dodgers/Angels) and matches no alias;
+  // CHC alone is unambiguous and carries the match.
+  assert.strictEqual(Intel.matchGameByText(GAMES, 'LA 1 CHC 0 IMANAGA P: 11'), GAMES[1]);
 });
