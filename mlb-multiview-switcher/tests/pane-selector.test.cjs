@@ -335,3 +335,49 @@ test('escapes land on the highest-priority watchable pane', () => {
   });
   assert.strictEqual(result.index, 2, 'priorities pick the destination, never cause a move');
 });
+
+// --- cooling: a pane that just ran a commercial has not earned the audio back ---
+
+test('a cooling pane is never chosen as a destination', () => {
+  const result = choose({
+    panes: [pane('a', true), { key: 'b', cooling: true }, pane('c')],
+    priorities: ['a', 'b', 'c'],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result.index, 2, 'b just showed a break — c gets the audio');
+});
+
+test('cooling is never a reason to leave a playing pane', () => {
+  const result = choose({
+    panes: [{ key: 'a', cooling: true }, pane('b')],
+    priorities: ['a', 'b'],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result, null);
+});
+
+test('when everything watchable is cooling, a cooling pane is still better than a break', () => {
+  const result = choose({
+    panes: [pane('a', true), { key: 'b', cooling: true }],
+    priorities: ['a', 'b'],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result.index, 1);
+});
+
+test('cooling applies in the replay fallback tier too', () => {
+  const result = choose({
+    panes: [
+      pane('a', true),
+      { key: 'b', notLive: true, cooling: true },
+      { key: 'c', notLive: true },
+    ],
+    priorities: [],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result.index, 2, 'the replay that did not just run a break wins');
+});

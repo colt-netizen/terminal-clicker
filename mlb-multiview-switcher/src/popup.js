@@ -106,6 +106,7 @@ function renderPanes(state) {
     li.appendChild(el('span', 'pane-name', pane.label));
     if (pane.stateText) li.appendChild(tag(pane.stateText));
     if (pane.inBreak) li.appendChild(tag('break'));
+    else if (pane.cooling) li.appendChild(tag('cooling'));
     else if (!pane.live) li.appendChild(tag(state.replayMode ? 'replay' : 'dead'));
     if (pane.isPrimary) li.appendChild(tag('audio', true));
     list.appendChild(li);

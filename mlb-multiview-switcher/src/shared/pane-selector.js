@@ -54,15 +54,25 @@
       // audio every half-inning), but never a destination either — arriving
       // during the commercial window buys zero seconds of baseball.
       paused: Boolean(pane.paused),
+      // Recently showed a break banner: same asymmetry. A pane that just ran
+      // a commercial has not earned the audio back yet — it cools first.
+      cooling: Boolean(pane.cooling),
       rank: rankOf(pane.key, priorities),
     }));
 
-    const liveAvailable = ranked.filter((p) => !p.inBreak && !p.notLive && !p.paused);
+    const cooled = (list) => {
+      const calm = list.filter((p) => !p.cooling);
+      // Everything eligible is cooling (all panes cycled through breaks):
+      // better a cooling pane than none at all.
+      return calm.length ? calm : list;
+    };
+
+    const liveAvailable = cooled(ranked.filter((p) => !p.inBreak && !p.notLive && !p.paused));
     // Nothing on screen is live baseball — a replay night (every game final),
     // or every live pane is between innings. The user still chose these feeds,
     // so the job degrades to keeping the audio off the break slates: anything
     // that is not a "Commercial Break in Progress" screen is watchable.
-    const available = liveAvailable.length ? liveAvailable : ranked.filter((p) => !p.inBreak);
+    const available = liveAvailable.length ? liveAvailable : cooled(ranked.filter((p) => !p.inBreak));
     if (!available.length) return null;
 
     // Lowest rank wins; ties fall back to display order so the choice is stable.

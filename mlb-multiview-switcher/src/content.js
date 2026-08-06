@@ -505,7 +505,7 @@
     (info.panes || []).forEach((p, i) => {
       const marks = [
         p.stateText || '?',
-        p.inBreak ? 'BREAK' : p.live ? 'live' : info.replayMode ? 'replay' : `dead: ${p.liveReason}`,
+        p.inBreak ? 'BREAK' : p.cooling ? 'cooling' : p.live ? 'live' : info.replayMode ? 'replay' : `dead: ${p.liveReason}`,
         p.isPrimary ? 'audio' : '',
       ].filter(Boolean);
       lines.push(`  ${i + 1}. ${p.label} [${marks.join(' | ')}]`);

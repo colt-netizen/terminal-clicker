@@ -71,6 +71,20 @@ const AUDIO_DWELL_MS = 20000;
  * audio dives straight back into the commercial.
  */
 const BREAK_CLEAR_MS = 6000;
+/**
+ * After a pane's break banner clears it stays "cooling" this long: not a
+ * reason to leave it, but ineligible as a destination. A pane that just
+ * showed a commercial does not get the audio back the moment it looks clean —
+ * flickery detection kept luring the audio straight back into slates.
+ */
+const BREAK_COOL_MS = 45000;
+/**
+ * Impatience window after a switch: if the pane we just landed on shows a
+ * break or dead air within this window, the landing was premature — bail
+ * immediately (no dwell) and heat the pane so the next escape avoids it.
+ * Patience is for games we are settled into, not for bad landings.
+ */
+const PROBE_MS = 8000;
 
 /** tabId -> Map<paneKey, when the break banner was last seen>. */
 const breakSeen = new Map();
@@ -244,10 +258,12 @@ function paneList(tabId, now, teamPriorities) {
         Intel.matchGameByText(games, pane.text);
 
       // Sticky break: entering is immediate, leaving requires the banner to
-      // stay gone for BREAK_CLEAR_MS.
+      // stay gone for BREAK_CLEAR_MS. After that the pane keeps cooling for
+      // BREAK_COOL_MS — watchable to stay on, ineligible to switch to.
       if (pane.inBreak) seen.set(pane.key, now);
-      const inBreak =
-        Boolean(pane.inBreak) || (seen.has(pane.key) && now - seen.get(pane.key) < BREAK_CLEAR_MS);
+      const sinceBanner = seen.has(pane.key) ? now - seen.get(pane.key) : Infinity;
+      const inBreak = Boolean(pane.inBreak) || sinceBanner < BREAK_CLEAR_MS;
+      const cooling = !inBreak && sinceBanner < BREAK_COOL_MS;
       pane = { ...pane, inBreak };
 
       let railState = null;
@@ -286,6 +302,8 @@ function paneList(tabId, now, teamPriorities) {
         notLiveReason: liveness.reason,
         // Between half-innings: never a destination, never a reason to leave.
         paused: Boolean(game) && Intel.betweenInnings(game),
+        // Recently showed a break: never a destination until cooled.
+        cooling,
       });
     });
   }
@@ -528,13 +546,26 @@ async function evaluate(tabId, { audioDead, blocked }) {
   let switched = { switched: false };
   if (now - (lastSwitch.get(tabId) || 0) >= SWITCH_COOLDOWN_MS) {
     const sinceSwitch = now - (lastSwitch.get(tabId) || 0);
+    const current = panes[currentIndex(tabId, panes)];
+
+    // Impatience: we JUST landed here. If this pane immediately shows a break
+    // or dead air, the landing was bad — bail without waiting out the dwell,
+    // and heat the pane so the next escape avoids it.
+    const probing = sinceSwitch <= PROBE_MS;
+    const badLanding = probing && current && (current.inBreak || audioDead);
+    if (badLanding && current) {
+      const seenMap = breakSeen.get(tabId);
+      if (seenMap) seenMap.set(current.key, now);
+    }
+
     const decision = Selector.choose({
       panes,
       priorities,
       currentIndex: currentIndex(tabId, panes),
-      // Dead air may only move the audio once per dwell window; definite
-      // signals (breaks, dead games) keep the ordinary cooldown.
-      audioDead: audioDead && sinceSwitch >= AUDIO_DWELL_MS,
+      // Dead air may only move the audio once per dwell window when settled;
+      // a bad landing gets no such patience. Definite signals (breaks, dead
+      // games) keep the ordinary cooldown either way.
+      audioDead: audioDead && (badLanding || sinceSwitch >= AUDIO_DWELL_MS),
       // Never. The tool exists to escape ad breaks and dead games, not to
       // "improve" on a game that is being played. While the current pane is
       // showing baseball, nothing outranks it — priorities only pick where an
@@ -716,6 +747,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             live: p.live,
             liveReason: p.liveReason,
             inBreak: p.inBreak,
+            cooling: p.cooling,
             isPrimary: p.isPrimary,
           })),
           railCards: rail && now - rail.ts <= FRAME_TTL_MS ? rail.cards.length : 0,
@@ -775,6 +807,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             key: p.key,
             label: p.label,
             inBreak: p.inBreak,
+            cooling: p.cooling,
             isPrimary: p.isPrimary,
             stateText: p.stateText,
             live: p.live,
