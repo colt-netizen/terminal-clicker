@@ -33,13 +33,18 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /** Messaging that tolerates the worker being asleep or the extension reloading. */
-  async function toWorker(message) {
-    try {
-      return await chrome.runtime.sendMessage(message);
-    } catch {
-      return null;
-    }
+  /**
+   * Messaging that tolerates the worker being asleep, the extension reloading,
+   * or — critically — a worker handler that never responds. Without the
+   * timeout, one unanswered message left the tick loop's in-flight guard set
+   * forever and every decision stopped ("phase not running") while reports
+   * kept flowing.
+   */
+  function toWorker(message) {
+    return Promise.race([
+      chrome.runtime.sendMessage(message).catch(() => null),
+      sleep(3000).then(() => null),
+    ]);
   }
 
   // ---------------------------------------------------------------- panes
@@ -154,19 +159,48 @@
     }
 
     const pattern = breakPattern();
+    const overlays = breakOverlayRects(pattern);
     return containers.map((pane, index) => {
       const { key, label, tokens } = derivePaneKey(pane.container, index);
       const text = paneText(pane.container);
+      const rect = pane.container.getBoundingClientRect();
       return {
         ...pane,
         key,
         label,
         tokens,
         text: text.slice(0, 200),
-        inBreak: pattern.test(text),
+        inBreak: pattern.test(text) || overlays.some((r) => centreInside(rect, r)),
         active: looksActive(pane.container),
       };
     });
+  }
+
+  /**
+   * The break slate is rendered in an overlay that MLB's app portals OUTSIDE
+   * the pane's own subtree, so scanning the pane container's text never sees
+   * it — which is why break panes kept reading as watchable. Instead: find the
+   * break text anywhere in the document and remember where it sits on screen;
+   * a pane is in break if one of those rectangles lands inside it.
+   */
+  function breakOverlayRects(pattern) {
+    const rects = [];
+    const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (!pattern.test(node.nodeValue || '')) continue;
+      const el = node.parentElement;
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) rects.push(r);
+    }
+    return rects;
+  }
+
+  function centreInside(outer, r) {
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    return cx >= outer.left && cx <= outer.right && cy >= outer.top && cy <= outer.bottom;
   }
 
   // ------------------------------------------------------------- game rail
@@ -453,6 +487,8 @@
         lastAction = `${result.reason} -> ${result.label || `pane ${result.index + 1}`}`;
       }
       renderHud(state);
+    } catch (error) {
+      lastAction = `tick error: ${(error && error.message) || error}`;
     } finally {
       ticking = false;
     }

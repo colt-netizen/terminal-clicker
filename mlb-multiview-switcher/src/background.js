@@ -583,6 +583,20 @@ function gamesForPopup() {
 
 // ----------------------------------------------------------------- routing
 
+/**
+ * Every async handler answers through this, so an exception can never leave a
+ * message channel hanging. An unanswered message deadlocked the content
+ * script's tick loop once (its in-flight guard never cleared) — the extension
+ * kept reporting but stopped deciding.
+ */
+function respond(sendResponse, work) {
+  Promise.resolve()
+    .then(work)
+    .then((result) => sendResponse(result ?? { ok: true }))
+    .catch((error) => sendResponse({ ok: false, error: String((error && error.message) || error) }));
+  return true;
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender.tab && sender.tab.id;
 
@@ -604,14 +618,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // The coordinator asking whether the audio should move.
     case 'evaluate': {
       if (tabId == null) return false;
-      evaluate(tabId, msg).then(sendResponse);
-      return true;
+      return respond(sendResponse, () => evaluate(tabId, msg));
     }
 
     // A real (isTrusted) click landed on a pane.
     case 'userSelect': {
       if (tabId == null) return false;
-      userSelect(tabId, sender.frameId ?? 0, msg.local);
+      userSelect(tabId, sender.frameId ?? 0, msg.local).catch(() => {});
       return false;
     }
 
@@ -619,11 +632,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'getState': {
       if (tabId == null) return false;
       if (msg.status) status.set(tabId, { ...msg.status, ts: Date.now() });
-      Promise.all([tabAudio(tabId), currentSettings()]).then(([info, settings]) => {
+      return respond(sendResponse, async () => {
+        const [info, settings] = await Promise.all([tabAudio(tabId), currentSettings()]);
         const now = Date.now();
         const panes = paneList(tabId, now, settings.teamPriorities);
         const rail = rails.get(tabId);
-        sendResponse({
+        return {
           ...audioState(tabId, info, now),
           totalPanes: panes.length,
           panes: panes.map((p) => ({
@@ -637,15 +651,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           railCards: rail && now - rail.ts <= FRAME_TTL_MS ? rail.cards.length : 0,
           apiGames: schedule.games.length,
           tuneTripped: tuneTripped.has(tabId),
-        });
+        };
       });
-      return true;
     }
 
     case 'requestSwitch': {
       if (tabId == null) return false;
-      rotate(tabId).then(sendResponse);
-      return true;
+      return respond(sendResponse, () => rotate(tabId));
     }
 
     // From the offscreen analyser.
@@ -666,26 +678,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     // Popup controls.
     case 'popupSwitch': {
-      rotate(msg.tabId).then(sendResponse);
-      return true;
+      return respond(sendResponse, () => rotate(msg.tabId));
     }
 
     case 'startListening': {
-      startListening(msg).then(sendResponse);
-      return true;
+      return respond(sendResponse, () => startListening(msg));
     }
 
     case 'stopListening': {
-      stopListening(msg.tabId).then(sendResponse);
-      return true;
+      return respond(sendResponse, () => stopListening(msg.tabId));
     }
 
     case 'popupStatus': {
-      Promise.all([tabAudio(msg.tabId), currentSettings()]).then(([info, settings]) => {
+      return respond(sendResponse, async () => {
+        const [info, settings] = await Promise.all([tabAudio(msg.tabId), currentSettings()]);
         const now = Date.now();
         const known = status.get(msg.tabId);
         const panes = paneList(msg.tabId, now, settings.teamPriorities);
-        sendResponse({
+        return {
           ...audioState(msg.tabId, info, now),
           totalPanes: panes.length,
           panes: panes.map((p) => ({
@@ -700,9 +710,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           tuneTripped: tuneTripped.has(msg.tabId),
           phase: known ? known.phase : 'unknown',
           stale: !known || now - known.ts > FRAME_TTL_MS,
-        });
+        };
       });
-      return true;
     }
 
     default:
