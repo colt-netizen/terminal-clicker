@@ -84,6 +84,30 @@ test('window edges are shrunk so predictions never clip action', () => {
   assert.strictEqual(Align.inAdWindow(WINDOWS, offset, justInside), false);
 });
 
+test('one break plus negative evidence resolves without a second break', () => {
+  const trueOffset = T0 - 7 * MIN;
+  // One confirmed break inside window 1.
+  const posA = WINDOWS[1].start + 30000 - trueOffset;
+  const sets = [Align.offsetCandidates(WINDOWS, posA)];
+  assert.strictEqual(Align.resolveOffset(sets), null, 'one break alone is ambiguous');
+
+  // Confirmed commentary, sampled every 5s the way ambient listening does:
+  // the FULL action span between each pair of ad windows (staying 60s clear
+  // of the edges, as sustained-speech detection naturally does). Each sample
+  // rules out every offset that would have placed it inside a window.
+  let bad = [];
+  for (let w = 0; w + 1 < WINDOWS.length; w++) {
+    for (let wall = WINDOWS[w].end + 60000; wall <= WINDOWS[w + 1].start - 60000; wall += 5000) {
+      const pos = wall - trueOffset;
+      bad = Align.mergeIntervals([...bad, ...Align.offsetCandidates(WINDOWS, pos)]);
+    }
+  }
+  const resolved = Align.resolveOffset(sets, 20000, bad);
+  assert.ok(resolved, 'listening should whittle the candidates to one');
+  assert.strictEqual(resolved.support, 1);
+  assert.ok(Math.abs(resolved.offset - trueOffset) < 90000, `off by ${resolved.offset - trueOffset}`);
+});
+
 test('windowRemaining reports time left in the current pod', () => {
   const offset = 0;
   const pos = WINDOWS[0].start + 30000;

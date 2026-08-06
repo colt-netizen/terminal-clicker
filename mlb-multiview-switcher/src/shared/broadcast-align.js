@@ -56,22 +56,46 @@
    * exactly one candidate from the newest set is supported by at least two
    * sets (within tolerance) and no rival ties it.
    */
-  function resolveOffset(sets, tolMs = 20000) {
-    if (!sets || sets.length < 2) return null;
+  function resolveOffset(sets, tolMs = 20000, bad = []) {
+    if (!sets || !sets.length) return null;
+    // Negative evidence gets a wide safety margin: a candidate's midpoint can
+    // sit ~half a window away from the true offset, and speech detected just
+    // outside a real break must never disqualify the true candidate.
+    const badMargin = Math.max(tolMs, 45000);
+    const isBad = (x) => (bad || []).some((iv) => x > iv.lo + badMargin && x < iv.hi - badMargin);
     const support = (x) =>
       sets.filter((set) => set.some((iv) => x >= iv.lo - tolMs && x <= iv.hi + tolMs)).length;
     const latest = sets[sets.length - 1];
     let bestSup = 0;
-    const scored = latest.map((iv) => {
-      const mid = (iv.lo + iv.hi) / 2;
-      const sup = support(mid);
-      if (sup > bestSup) bestSup = sup;
-      return { mid, sup };
-    });
-    if (bestSup < 2) return null;
+    const scored = latest
+      .map((iv) => {
+        const mid = (iv.lo + iv.hi) / 2;
+        return { mid, sup: support(mid) };
+      })
+      // Negative evidence: offsets that would have placed confirmed commentary
+      // inside an ad window are impossible.
+      .filter((s) => !isBad(s.mid));
+    for (const s of scored) if (s.sup > bestSup) bestSup = s.sup;
+    if (!scored.length) return null;
+    // Two positive detections agreeing, OR one detection whittled to a single
+    // survivor by negative evidence — either resolves.
     const winners = scored.filter((s) => s.sup === bestSup);
-    if (winners.length !== 1) return null; // ambiguous — wait for another break
-    return { offset: winners[0].mid, support: bestSup };
+    if (winners.length !== 1) return null;
+    if (bestSup >= 2) return { offset: winners[0].mid, support: bestSup };
+    if (sets.length === 1 && scored.length === 1) return { offset: winners[0].mid, support: 1 };
+    return null;
+  }
+
+  /** Merge overlapping/adjacent intervals; keeps the bad-evidence list small. */
+  function mergeIntervals(list, joinMs = 5000) {
+    const sorted = [...(list || [])].sort((a, b) => a.lo - b.lo);
+    const out = [];
+    for (const iv of sorted) {
+      const last = out[out.length - 1];
+      if (last && iv.lo <= last.hi + joinMs) last.hi = Math.max(last.hi, iv.hi);
+      else out.push({ ...iv });
+    }
+    return out;
   }
 
   /**
@@ -92,5 +116,5 @@
     return w ? w.end - wall : null;
   }
 
-  return { adWindows, offsetCandidates, resolveOffset, inAdWindow, windowRemaining };
+  return { adWindows, offsetCandidates, resolveOffset, mergeIntervals, inAdWindow, windowRemaining };
 });

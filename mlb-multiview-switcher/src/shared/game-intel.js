@@ -334,7 +334,14 @@
     const rest = list
       .filter((e) => !taken.has(e.key))
       .sort((a, b) => (b.interest || 0) - (a.interest || 0) || a.index - b.index);
-    return [...held, ...teamed, ...rest].map((e) => e.key);
+    return {
+      order: [...held, ...teamed, ...rest].map((e) => e.key),
+      // Slot 0 is only a PREFERENCE — something upgrades may return to — when
+      // it is the user's click or a designated team. Interest ordering merely
+      // aims escapes; letting the interest leader claim the upgrade rule sent
+      // the audio ladder-climbing "to a better game" every few seconds.
+      topIsPreference: held.length > 0 || teamed.length > 0,
+    };
   }
 
   // ------------------------------------------------------- click affinity

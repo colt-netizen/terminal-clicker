@@ -488,12 +488,9 @@ test('pecking order: click first, then teams, then interest', () => {
     { key: 'thriller', teamRank: Number.MAX_SAFE_INTEGER, interest: 95, blowout: false },
     { key: 'clicked', teamRank: Number.MAX_SAFE_INTEGER, interest: 10, blowout: false },
   ];
-  assert.deepStrictEqual(Intel.buildPriorities(entries, 'clicked'), [
-    'clicked',
-    'myteam',
-    'thriller',
-    'meh',
-  ]);
+  const built = Intel.buildPriorities(entries, 'clicked');
+  assert.deepStrictEqual(built.order, ['clicked', 'myteam', 'thriller', 'meh']);
+  assert.strictEqual(built.topIsPreference, true, 'a click is a genuine preference');
 });
 
 test('pecking order: a blown-out designated team falls to its interest slot', () => {
@@ -501,7 +498,23 @@ test('pecking order: a blown-out designated team falls to its interest slot', ()
     { key: 'myteam', teamRank: 0, interest: 40, blowout: true },
     { key: 'thriller', teamRank: Number.MAX_SAFE_INTEGER, interest: 95, blowout: false },
   ];
-  assert.deepStrictEqual(Intel.buildPriorities(entries, null), ['thriller', 'myteam']);
+  const built = Intel.buildPriorities(entries, null);
+  assert.deepStrictEqual(built.order, ['thriller', 'myteam']);
+  assert.strictEqual(
+    built.topIsPreference,
+    false,
+    'interest leadership is NOT a preference — upgrades must not chase it'
+  );
+});
+
+test('pecking order: no click and no teams means no preference at the top', () => {
+  const entries = [
+    { key: 'a', teamRank: Number.MAX_SAFE_INTEGER, interest: 30, blowout: false },
+    { key: 'b', teamRank: Number.MAX_SAFE_INTEGER, interest: 46, blowout: false },
+  ];
+  const built = Intel.buildPriorities(entries, null);
+  assert.deepStrictEqual(built.order, ['b', 'a']);
+  assert.strictEqual(built.topIsPreference, false);
 });
 
 // --- break episodes: evidence-based, dialled to real ad pods ---
@@ -599,5 +612,5 @@ test('lean folded into interest reorders the unranked tier', () => {
     { key: 'toolPick', teamRank: Number.MAX_SAFE_INTEGER, interest: 80 - 15 * 1.5, blowout: false },
     { key: 'viewerPick', teamRank: Number.MAX_SAFE_INTEGER, interest: 70 + 15 * 2, blowout: false },
   ];
-  assert.deepStrictEqual(Intel.buildPriorities(entries, null), ['viewerPick', 'toolPick']);
+  assert.deepStrictEqual(Intel.buildPriorities(entries, null).order, ['viewerPick', 'toolPick']);
 });

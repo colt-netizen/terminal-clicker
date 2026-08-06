@@ -153,6 +153,16 @@ const paneHeat = new Map();
 /** tabId -> timestamp of the last promotion. */
 const lastSwitch = new Map();
 
+/**
+ * After a user click the extension is fully hands-off for this long: no
+ * escapes, no upgrades, no probe bails, no tuning. The log showed the machine
+ * overriding user clicks within 2-4 seconds (probe bail, upgrade rule); the
+ * user is the source of truth, and their placement outranks every heuristic
+ * while the lock runs.
+ */
+const USER_LOCK_MS = 60000;
+const userLockUntil = new Map();
+
 // -------------------------------------------------- broadcast alignment
 //
 // Predictive ad windows for replays: play-by-play timestamps give every ad
@@ -193,10 +203,40 @@ function alignmentFor(tabId, affKey) {
   }
   let a = m.get(affKey);
   if (!a) {
-    a = { sets: [], offset: null };
+    a = { sets: [], bad: [], offset: null, lastNegAt: 0 };
     m.set(affKey, a);
   }
   return a;
+}
+
+/**
+ * Confirmed commentary on the audio pane is negative alignment evidence: the
+ * current position is NOT inside an ad window, so offsets that would place it
+ * in one are impossible. With one positive detection plus a few minutes of
+ * ordinary listening, the offset resolves without a second break.
+ */
+function feedSpeechEvidence(tabId, pane, now) {
+  if (!pane || !pane.gamePk || pane.kind !== 'final') return;
+  const entry = pbpCache.get(pane.gamePk);
+  if (!entry || !entry.windows.length) return;
+  const pos = panePos.get(tabId) ? panePos.get(tabId).get(pane.key) : null;
+  if (!pos || now - pos.at > 5000) return;
+  const a = alignmentFor(tabId, pane.affKey);
+  if (a.offset !== null || now - a.lastNegAt < 5000) return;
+  a.lastNegAt = now;
+  a.bad = Align.mergeIntervals([...a.bad, ...Align.offsetCandidates(entry.windows, pos.posMs)]).slice(0, 200);
+  if (a.sets.length) {
+    const resolved = Align.resolveOffset(a.sets, 20000, a.bad);
+    if (resolved) {
+      a.offset = resolved.offset;
+      logEvent(tabId, 'alignment-resolved', {
+        pane: pane.key,
+        gamePk: pane.gamePk,
+        support: resolved.support,
+        via: 'negative-evidence',
+      });
+    }
+  }
 }
 
 /**
@@ -214,7 +254,7 @@ function feedBreakDetection(tabId, pane) {
   if (a.offset !== null) return; // already solved
   a.sets.push(Align.offsetCandidates(entry.windows, pos.posMs));
   if (a.sets.length > 5) a.sets = a.sets.slice(-5);
-  const resolved = Align.resolveOffset(a.sets);
+  const resolved = Align.resolveOffset(a.sets, 20000, a.bad);
   if (resolved) {
     a.offset = resolved.offset;
     logEvent(tabId, 'alignment-resolved', {
@@ -433,7 +473,16 @@ function paneList(tabId, now, opts) {
   }
 
   const out = [];
-  for (const frame of liveFrames(tabId, now)) {
+  // The multiview surface is ONE frame — the one with the most panes. Mixing
+  // frames made the roster flap between a 1-pane featured player and the
+  // 4-pane grid, which changed pane keys under the user's hold (deleting it)
+  // and scrambled the cursor. The log showed exactly that.
+  const framesAlive = liveFrames(tabId, now);
+  const surface = framesAlive.reduce(
+    (best, f) => ((f.panes || []).length > ((best && best.panes) || []).length ? f : best),
+    null
+  );
+  for (const frame of surface ? [surface] : []) {
     (frame.panes || []).forEach((pane, local) => {
       const tokens = pane.tokens && pane.tokens.length ? pane.tokens : Intel.tokensFromKey(pane.key);
       // Track playback position for the alignment solver.
@@ -521,7 +570,11 @@ function paneList(tabId, now, opts) {
         stateText: game ? Intel.describeApiGame(game) : railState ? railState.kind : '',
         teamRank: Intel.teamRankOfGame(game, teamPriorities),
         interest: game ? Intel.interestScore(game) : 0,
-        blowout: game ? Intel.teamBlowoutLoss(game, teamPriorities) : false,
+        // A blowout only demotes a LIVE game — pulling to something closer is
+        // about salvaging the night as it unfolds. A replay of a final the
+        // viewer chose keeps its team rank regardless of the score; demoting
+        // it left the designated team dead last in every priority list.
+        blowout: game && liveness.live ? Intel.teamBlowoutLoss(game, teamPriorities) : false,
         live: liveness.live,
         liveReason: liveness.reason,
         // For the selector: dead-but-not-break panes are ineligible with a
@@ -763,6 +816,8 @@ async function evaluate(tabId, { audioDead, blocked }) {
 
   if (blocked || panes.length < 2) return { switched: false };
   if (!settings.enabled) return { switched: false };
+  // Hands-off while the user's placement is fresh: their click is the truth.
+  if (now < (userLockUntil.get(tabId) || 0)) return { switched: false, userLock: true };
 
   // The user's click is the strongest ranking there is. It holds as long as
   // the pane exists — on replay nights every pane reads "not live", and
@@ -781,7 +836,7 @@ async function evaluate(tabId, { audioDead, blocked }) {
   // blown out), then everything else by interest — closest, latest games
   // first. Position 0 is THE most important game: the only pane upgrades may
   // return to when its ad ends. The rest of the order just aims escapes.
-  const priorities = Intel.buildPriorities(
+  const built = Intel.buildPriorities(
     panes.map((p) => ({
       key: p.key,
       teamRank: p.teamRank,
@@ -791,7 +846,8 @@ async function evaluate(tabId, { audioDead, blocked }) {
     })),
     heldKey
   );
-  const topKey = priorities[0];
+  const priorities = built.order;
+  const topKey = built.topIsPreference ? priorities[0] : null;
 
   let switched = { switched: false };
   if (now - (lastSwitch.get(tabId) || 0) >= SWITCH_COOLDOWN_MS) {
@@ -807,7 +863,10 @@ async function evaluate(tabId, { audioDead, blocked }) {
     const heard = speech.get(tabId);
     const listening = Boolean(heard && now - heard.ts < SPEECH_TTL_MS);
     if (!lastAlive.has(tabId)) lastAlive.set(tabId, now);
-    if (listening && heard.speechPresent) lastAlive.set(tabId, now);
+    if (listening && heard.speechPresent) {
+      lastAlive.set(tabId, now);
+      if (current) feedSpeechEvidence(tabId, current, now);
+    }
     const deadStreak = now - lastAlive.get(tabId);
     if (listening) {
       const prev = aliveScore.has(tabId) ? aliveScore.get(tabId) : 0.5;
@@ -853,9 +912,10 @@ async function evaluate(tabId, { audioDead, blocked }) {
         const dwellNeeded = current && current.paused ? SWITCH_COOLDOWN_MS : AUDIO_DWELL_MS;
         return (listening ? confidence < escapeConf : audioDead) && sinceSwitch >= dwellNeeded;
       })(),
-      // Escapes always; upgrades only back to THE most important game (the
-      // user's click or their designated team) once it is watchable again.
-      allowUpgrade: 'top',
+      // Escapes always; upgrades ONLY back to a genuine preference (the
+      // user's click or their designated team). When neither exists, no pane
+      // is worth stealing from a playing game — interest just aims escapes.
+      allowUpgrade: built.topIsPreference ? 'top' : false,
     });
     if (decision) {
       const departed = current;
@@ -939,10 +999,13 @@ async function userSelect(tabId, frameId, local) {
     affMap.set(key, { v: Math.max(-AFFINITY_CAP, Math.min(AFFINITY_CAP, prev + delta)), at: now });
   };
   const clicked = panes[index];
-  bump(clicked.affKey, CLICK_BOOST);
   const curIdx = currentIndex(tabId, panes);
   const abandoned = curIdx >= 0 && curIdx !== index ? panes[curIdx] : null;
+  // Clicking the pane that already has audio is "stay here", not new evidence
+  // of desirability — refresh the hold and lock, teach nothing.
+  if (abandoned) bump(clicked.affKey, CLICK_BOOST);
   if (abandoned && placedBy.get(tabId) === 'extension') bump(abandoned.affKey, -ABANDON_PENALTY);
+  userLockUntil.set(tabId, now + USER_LOCK_MS);
 
   // Clicking away = confirmed break on the abandoned pane. Toxic for the
   // length of an average ad pod, unconditionally.
@@ -960,6 +1023,7 @@ async function userSelect(tabId, frameId, local) {
     clicked: snapPane(clicked),
     abandoned: abandoned ? snapPane(abandoned) : null,
     heatAppliedMs: abandoned ? CLICK_AWAY_HEAT_MS : 0,
+    userLockMs: USER_LOCK_MS,
     placedBy: placedBy.get(tabId) || null,
     // How long after our placement the user overrode it: the "too slow or
     // wrong" measurement.
@@ -1233,6 +1297,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   lastAlive.delete(tabId);
   alignments.delete(tabId);
   panePos.delete(tabId);
+  userLockUntil.delete(tabId);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
