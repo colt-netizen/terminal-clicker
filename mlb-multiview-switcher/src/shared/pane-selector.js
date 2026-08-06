@@ -58,22 +58,32 @@
       // Recently showed a break banner: same asymmetry. A pane that just ran
       // a commercial has not earned the audio back yet — it cools first.
       cooling: Boolean(pane.cooling),
+      // Suspected dead by audio evidence (we escaped it for silence). Unlike
+      // cooling — which trusts a fully-elapsed ad pod — heat blocks arrivals
+      // for EVERY pane, including rank 0. Slates burned into the stream leave
+      // no DOM trace, so "looks watchable" is no evidence at all; without
+      // this, the return-to-top rule boomerangs the audio straight back into
+      // the slate it just escaped.
+      heated: Boolean(pane.heated),
       rank: rankOf(pane.key, priorities),
     }));
 
-    const cooled = (list) => {
-      const calm = list.filter((p) => !p.cooling);
-      // Everything eligible is cooling (all panes cycled through breaks):
-      // better a cooling pane than none at all.
-      return calm.length ? calm : list;
+    const dropHeated = (list) => {
+      const ok = list.filter((p) => !p.heated);
+      return ok.length ? ok : list; // everything heated: better one than none
     };
+    const dropCooling = (list) => {
+      const ok = list.filter((p) => !p.cooling);
+      return ok.length ? ok : list;
+    };
+    const refine = (list) => dropCooling(dropHeated(list));
 
-    const liveAvailable = cooled(ranked.filter((p) => !p.inBreak && !p.notLive && !p.paused));
+    const liveAvailable = refine(ranked.filter((p) => !p.inBreak && !p.notLive && !p.paused));
     // Nothing on screen is live baseball — a replay night (every game final),
     // or every live pane is between innings. The user still chose these feeds,
     // so the job degrades to keeping the audio off the break slates: anything
     // that is not a "Commercial Break in Progress" screen is watchable.
-    const available = liveAvailable.length ? liveAvailable : cooled(ranked.filter((p) => !p.inBreak));
+    const available = liveAvailable.length ? liveAvailable : refine(ranked.filter((p) => !p.inBreak));
     if (!available.length) return null;
 
     // Lowest rank wins; ties fall back to display order so the choice is stable.

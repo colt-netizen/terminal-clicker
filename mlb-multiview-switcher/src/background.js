@@ -81,9 +81,28 @@ const HEAT_MS = 30000;
  * minutes; a commentary lull rarely stretches past thirty seconds.
  */
 const DEAD_AIR_ESCAPE_MS = 45000;
+/**
+ * Heat applied to a pane we escaped for silence: roughly the remainder of an
+ * ad pod. Until it expires the pane cannot receive audio again — not even as
+ * the top priority — because in-stream slates leave no DOM trace and "looks
+ * watchable" is no evidence. Without this, escape + return-to-top boomerangs
+ * the audio straight back into the slate.
+ */
+const AUDIO_ESCAPE_HEAT_MS = 90000;
+/**
+ * Commentary confidence for the audio pane: an EMA of speech presence rather
+ * than a strict continuous streak — one stray murmur spike must not reset a
+ * 45-second silence clock (that reset is why audio sat on slates forever).
+ * Alpha 0.03/tick at ~300ms decays ~1.0 -> 0.05 in ~30s of silence; real
+ * commentary (speech most ticks) holds well above 0.3.
+ */
+const ALIVE_ALPHA = 0.03;
+const ALIVE_ESCAPE_BELOW = 0.05;
 
 /** tabId -> last time the audio pane demonstrably had commentary. */
 const lastAlive = new Map();
+/** tabId -> commentary-confidence EMA for the current audio pane. */
+const aliveScore = new Map();
 
 /**
  * tabId -> Map<paneKey, break episode state> (see Intel.breakEpisode).
@@ -236,7 +255,9 @@ function liveFrames(tabId, now) {
  * naming a team). If none of that lands and the stats API is down, the rail's
  * printed state fills in via matching card tokens.
  */
-function paneList(tabId, now, teamPriorities) {
+function paneList(tabId, now, opts) {
+  const teamPriorities = (opts && opts.teamPriorities) || [];
+  const assignments = (opts && opts.paneAssignments) || {};
   const games = scheduleGames();
   const rail = rails.get(tabId);
   const cards = rail && now - rail.ts <= FRAME_TTL_MS ? rail.cards : [];
@@ -257,8 +278,10 @@ function paneList(tabId, now, teamPriorities) {
   for (const frame of liveFrames(tabId, now)) {
     (frame.panes || []).forEach((pane, local) => {
       const tokens = pane.tokens && pane.tokens.length ? pane.tokens : Intel.tokensFromKey(pane.key);
+      const assignedPk = assignments[pane.key];
       const game =
         Intel.matchByKey(games, pane.key) ||
+        (assignedPk ? games.find((g) => g.gamePk === assignedPk) : null) ||
         Intel.matchGame(games, tokens) ||
         Intel.matchGameByText(games, pane.text);
 
@@ -270,9 +293,12 @@ function paneList(tabId, now, teamPriorities) {
       if (episode.state) seen.set(pane.key, episode.state);
       else seen.delete(pane.key);
       const heatMap = paneHeat.get(tabId);
+      // Heat (suspected dead by audio) is deliberately separate from cooling
+      // (a trusted, fully-elapsed break episode): the top pane is exempt from
+      // cooling but never from heat.
       const heated = heatMap ? (heatMap.get(pane.key) || 0) > now : false;
       const inBreak = episode.inBreak;
-      const cooling = episode.cooling || heated;
+      const cooling = episode.cooling;
       pane = { ...pane, inBreak };
 
       let railState = null;
@@ -303,9 +329,9 @@ function paneList(tabId, now, teamPriorities) {
         gameLive: game ? Intel.classifyApiGame(game) === 'live' : false,
         kind: game ? Intel.classifyApiGame(game) : '',
         stateText: game ? Intel.describeApiGame(game) : railState ? railState.kind : '',
-        teamRank: Intel.teamRankOfGame(game, teamPriorities || []),
+        teamRank: Intel.teamRankOfGame(game, teamPriorities),
         interest: game ? Intel.interestScore(game) : 0,
-        blowout: game ? Intel.teamBlowoutLoss(game, teamPriorities || []) : false,
+        blowout: game ? Intel.teamBlowoutLoss(game, teamPriorities) : false,
         live: liveness.live,
         liveReason: liveness.reason,
         // For the selector: dead-but-not-break panes are ineligible with a
@@ -316,6 +342,9 @@ function paneList(tabId, now, teamPriorities) {
         paused: Boolean(game) && Intel.betweenInnings(game),
         // Recently showed a break: never a destination until cooled.
         cooling,
+        // Escaped for silence recently: never a destination, not even for
+        // the top-priority pane.
+        heated,
       });
     });
   }
@@ -379,6 +408,7 @@ async function promoteIndex(tabId, panes, index, options) {
   cursor.set(tabId, index);
   lastSwitch.set(tabId, Date.now());
   lastAlive.set(tabId, Date.now()); // fresh pane, fresh evidence clock
+  aliveScore.set(tabId, 0.5);
 
   const goLive = options && 'goLive' in options ? options.goLive : Boolean(target.gameLive);
   const sends = liveFrames(tabId, Date.now()).map((frame) => {
@@ -528,7 +558,7 @@ async function maybeTune(tabId, panes, settings, now) {
 async function evaluate(tabId, { audioDead, blocked }) {
   const now = Date.now();
   const settings = await currentSettings();
-  const panes = paneList(tabId, now, settings.teamPriorities);
+  const panes = paneList(tabId, now, settings);
   settlePendingTune(tabId, panes, now);
 
   if (blocked || panes.length < 2) return { switched: false };
@@ -566,12 +596,18 @@ async function evaluate(tabId, { audioDead, blocked }) {
     // or dead air, the landing was bad — bail without waiting out the dwell,
     // and heat the pane so the next escape avoids it.
     const probing = sinceSwitch <= PROBE_MS;
-    // Track how long the audio pane has demonstrably lacked commentary.
+    // Track commentary evidence for the audio pane: a fast clock for probe
+    // bails, and a tolerant EMA for settled escapes.
     const heard = speech.get(tabId);
     const listening = Boolean(heard && now - heard.ts < SPEECH_TTL_MS);
     if (!lastAlive.has(tabId)) lastAlive.set(tabId, now);
     if (listening && heard.speechPresent) lastAlive.set(tabId, now);
     const deadStreak = now - lastAlive.get(tabId);
+    if (listening) {
+      const prev = aliveScore.has(tabId) ? aliveScore.get(tabId) : 0.5;
+      aliveScore.set(tabId, prev * (1 - ALIVE_ALPHA) + (heard.speechPresent ? ALIVE_ALPHA : 0));
+    }
+    const confidence = aliveScore.has(tabId) ? aliveScore.get(tabId) : 0.5;
 
     // A landing is bad if it shows a break, or — when we can hear — stays
     // speechless for its first seconds (the alive-clock resets on promotion,
@@ -594,24 +630,36 @@ async function evaluate(tabId, { audioDead, blocked }) {
       panes: panes.map((p) => (p.key === topKey ? { ...p, cooling: false } : p)),
       priorities,
       currentIndex: currentIndex(tabId, panes),
-      // Dead air escapes come from OUR continuous streak when we can hear —
-      // not from the silence machine's pulses, whose backoff naps were leaving
-      // the audio parked on a slate while a watchable pane sat right there.
-      // The machine only matters in tab-flag mode, where there is no speech
-      // stream to measure. Either way: a commentary lull during a play must
-      // never eject the user (45s continuous requirement), and a bad landing
-      // keeps its fast bail.
+      // Dead air escapes come from OUR commentary-confidence EMA when we can
+      // hear — not from the silence machine's pulses (whose backoff naps left
+      // audio parked on slates) and not from a strict continuous streak
+      // (which one stray murmur spike resets forever). The machine only
+      // matters in tab-flag mode, where there is no speech stream. A
+      // commentary lull during a play decays slowly and never reaches the
+      // escape threshold; a slate's drone gets there in ~30s.
       audioDead:
         badLanding ||
-        ((listening ? deadStreak >= DEAD_AIR_ESCAPE_MS : audioDead) &&
+        ((listening ? confidence < ALIVE_ESCAPE_BELOW : audioDead) &&
           sinceSwitch >= AUDIO_DWELL_MS),
       // Escapes always; upgrades only back to THE most important game (the
       // user's click or their designated team) once it is watchable again.
       allowUpgrade: 'top',
     });
     if (decision) {
+      const departed = current;
       const result = await promoteIndex(tabId, panes, decision.index);
       switched = { switched: result.ok, ...result, reason: decision.reason };
+      // Escaped for silence: the departed pane is suspected to be running an
+      // in-stream slate. Heat it for the rest of the pod so the return rule
+      // cannot boomerang the audio straight back into it.
+      if (result.ok && departed && decision.reason === 'no audio on the current pane') {
+        let heatMap = paneHeat.get(tabId);
+        if (!heatMap) {
+          heatMap = new Map();
+          paneHeat.set(tabId, heatMap);
+        }
+        heatMap.set(departed.key, now + AUDIO_ESCAPE_HEAT_MS);
+      }
     }
   }
 
@@ -623,7 +671,7 @@ async function evaluate(tabId, { audioDead, blocked }) {
 /** Manual "switch now": step to the next pane regardless of state. */
 async function rotate(tabId) {
   const settings = await currentSettings();
-  const panes = paneList(tabId, Date.now(), settings.teamPriorities);
+  const panes = paneList(tabId, Date.now(), settings);
   if (panes.length < 2) return { ok: false, reason: 'need at least two panes' };
   const from = currentIndex(tabId, panes);
   const to = (from + 1) % panes.length;
@@ -636,7 +684,8 @@ async function rotate(tabId) {
  * frame's enforcement to it. No goLive snap — clicking to look at a pane is
  * not a request to lose your place in it. */
 async function userSelect(tabId, frameId, local) {
-  const panes = paneList(tabId, Date.now(), []);
+  const settings = await currentSettings();
+  const panes = paneList(tabId, Date.now(), settings);
   const index = panes.findIndex((p) => p.frameId === frameId && p.local === local);
   if (index === -1) return;
   manualHold.set(tabId, { key: panes[index].key });
@@ -715,7 +764,17 @@ function gamesForPopup() {
     .sort((a, b) => String(a.gameDate).localeCompare(String(b.gameDate)))
     .slice(0, 8)
     .map(compact);
-  return { live, upcoming, apiError: schedule.error, apiAgeMs: schedule.fetchedAt ? Date.now() - schedule.fetchedAt : null };
+  const finals = games
+    .filter((g) => Intel.classifyApiGame(g) === 'final')
+    .slice(0, 20)
+    .map(compact);
+  return {
+    live,
+    upcoming,
+    all: [...live, ...upcoming, ...finals],
+    apiError: schedule.error,
+    apiAgeMs: schedule.fetchedAt ? Date.now() - schedule.fetchedAt : null,
+  };
 }
 
 // ----------------------------------------------------------------- routing
@@ -772,7 +831,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return respond(sendResponse, async () => {
         const [info, settings] = await Promise.all([tabAudio(tabId), currentSettings()]);
         const now = Date.now();
-        const panes = paneList(tabId, now, settings.teamPriorities);
+        const panes = paneList(tabId, now, settings);
         const rail = rails.get(tabId);
         return {
           ...audioState(tabId, info, now),
@@ -788,6 +847,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           })),
           railCards: rail && now - rail.ts <= FRAME_TTL_MS ? rail.cards.length : 0,
           apiGames: schedule.games.length,
+          conf: Math.round((aliveScore.get(tabId) ?? 0.5) * 100) / 100,
           replayMode: isReplayContext(scheduleGames()),
           viewing: viewingMatchups(tabId, now),
           tuneTripped: tuneTripped.has(tabId),
@@ -835,7 +895,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const [info, settings] = await Promise.all([tabAudio(msg.tabId), currentSettings()]);
         const now = Date.now();
         const known = status.get(msg.tabId);
-        const panes = paneList(msg.tabId, now, settings.teamPriorities);
+        const panes = paneList(msg.tabId, now, settings);
         return {
           ...audioState(msg.tabId, info, now),
           totalPanes: panes.length,
@@ -872,6 +932,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   breakSeen.delete(tabId);
   paneHeat.delete(tabId);
   lastAlive.delete(tabId);
+  aliveScore.delete(tabId);
   lastSwitch.delete(tabId);
   pendingTune.delete(tabId);
   lastTune.delete(tabId);

@@ -381,3 +381,39 @@ test('cooling applies in the replay fallback tier too', () => {
   });
   assert.strictEqual(result.index, 2, 'the replay that did not just run a break wins');
 });
+
+// --- heat: suspected-dead panes cannot re-take audio, even at rank 0 ---
+
+test('a heated top-priority pane cannot pull the audio back', () => {
+  // The boomerang: we escaped the held pane for silence (in-stream slate,
+  // no DOM evidence), and 2.5s later "return to top" yanked audio right back.
+  const result = choose({
+    panes: [{ key: 'held', heated: true }, pane('other')],
+    priorities: ['held', 'other'],
+    currentIndex: 1,
+    audioDead: false,
+    allowUpgrade: 'top',
+  });
+  assert.strictEqual(result, null, 'heat blocks the return until the pane proves out');
+});
+
+test('once heat expires the top pane may reclaim the audio', () => {
+  const result = choose({
+    panes: [pane('held'), pane('other')],
+    priorities: ['held', 'other'],
+    currentIndex: 1,
+    audioDead: false,
+    allowUpgrade: 'top',
+  });
+  assert.strictEqual(result.index, 0);
+});
+
+test('heated panes are skipped as escape destinations when others exist', () => {
+  const result = choose({
+    panes: [pane('a', true), { key: 'b', heated: true }, pane('c')],
+    priorities: [],
+    currentIndex: 0,
+    audioDead: false,
+  });
+  assert.strictEqual(result.index, 2);
+});

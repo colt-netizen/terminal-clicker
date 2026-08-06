@@ -43,6 +43,14 @@
     spreadWindowMs: 1500,
     // Loud-to-quiet swing (p90 - p10) the window must show to count as speech.
     spreadDb: 8,
+    // Word cadence. Speech is a train of syllable onsets — sharp rises of
+    // several dB from a valley, a few every second. A slate's crowd bed can
+    // occasionally SWELL loud enough to beat the spread gate, but it swells
+    // slowly: well under one onset per second. Requiring onset rhythm in the
+    // human-speech range is what discerns actual words from background noise.
+    onsetProminenceDb: 4,
+    minOnsetsPerSec: 1.0,
+    maxOnsetsPerSec: 12,
     // Frames quieter than this are treated as true silence regardless of floor,
     // which stops the floor chasing digital silence down to -Infinity.
     absoluteFloorDb: -95,
@@ -101,6 +109,23 @@
     const sorted = state.recent.map((r) => r.db).sort((a, b) => a - b);
     const spreadDb = percentile(sorted, 0.9) - percentile(sorted, 0.1);
 
+    // Word cadence: count syllable-like onsets — rises of onsetProminenceDb
+    // from the running valley, at most one per 100ms. Speech produces a train
+    // of them; a crowd swell produces one every few seconds.
+    let onsets = 0;
+    let valley = Infinity;
+    let lastOnsetT = -Infinity;
+    for (const r of state.recent) {
+      valley = Math.min(valley, r.db);
+      if (r.db - valley >= cfg.onsetProminenceDb && r.t - lastOnsetT >= 100) {
+        onsets += 1;
+        lastOnsetT = r.t;
+        valley = r.db; // a new onset needs a fresh dip first
+      }
+    }
+    const spanSec = state.recent.length > 1 ? (now - state.recent[0].t) / 1000 : 0;
+    const onsetRate = onsets / Math.max(1, spanSec);
+
     if (state.floorDb === null) {
       state.floorDb = level;
     } else {
@@ -119,10 +144,13 @@
       speechPresent:
         recentDb > state.floorDb + cfg.marginDb &&
         recentDb > cfg.minSpeechDb &&
-        spreadDb >= cfg.spreadDb,
+        spreadDb >= cfg.spreadDb &&
+        onsetRate >= cfg.minOnsetsPerSec &&
+        onsetRate <= cfg.maxOnsetsPerSec,
       floorDb: state.floorDb,
       recentDb,
       spreadDb,
+      onsetRate,
     };
   }
 

@@ -102,6 +102,9 @@ function renderPanes(state) {
     list.appendChild(el('li', 'empty', 'No games detected yet.'));
     return;
   }
+  const assignable = (state && state.games && state.games.all) || [];
+  const assignments = settings.paneAssignments || {};
+
   for (const pane of panes) {
     const li = el('li');
     li.appendChild(el('span', 'pane-name', pane.label));
@@ -110,6 +113,25 @@ function renderPanes(state) {
     else if (pane.cooling) li.appendChild(tag('cooling'));
     else if (!pane.live) li.appendChild(tag(state.replayMode ? 'replay' : 'dead'));
     if (pane.isPrimary) li.appendChild(tag('audio', true));
+
+    // Manual identity: when auto-matching can't tell which game a pane shows
+    // (video pixels carry no DOM), the user says so once and priorities work.
+    const select = document.createElement('select');
+    select.className = 'assign';
+    select.appendChild(new Option('game?', ''));
+    for (const game of assignable) {
+      select.appendChild(new Option(`${game.matchup} (${game.state})`, String(game.gamePk)));
+    }
+    select.value = assignments[pane.key] ? String(assignments[pane.key]) : '';
+    select.addEventListener('change', async () => {
+      const next = { ...(settings.paneAssignments || {}) };
+      if (select.value) next[pane.key] = Number(select.value);
+      else delete next[pane.key];
+      settings = { ...settings, paneAssignments: next };
+      await Settings.save({ paneAssignments: next });
+      refresh();
+    });
+    li.appendChild(select);
     list.appendChild(li);
   }
 }

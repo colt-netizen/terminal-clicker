@@ -166,3 +166,22 @@ test('slightly wavering murmur still fails the spread gate', () => {
   const { speechFraction } = feed(levels.map((v) => v));
   assert.strictEqual(speechFraction, 0);
 });
+
+// --- word cadence: swells are not words ---
+
+test('a slow crowd swell that beats the spread gate still fails word cadence', () => {
+  // Baseline murmur at -60 with a 10dB swell lasting ~1s every 4s: the spread
+  // gate sees 10dB of range, but nothing resembling syllables.
+  const levels = [...Array(seconds(20))].map((_, i) => ((i % seconds(4)) < seconds(1) ? -50 : -60));
+  const { speechFraction } = feed(levels);
+  assert.strictEqual(speechFraction, 0, 'one swell per 4s is not speech');
+});
+
+test('speech cadence passes the onset gate', () => {
+  const { results } = feed(speechLike(-28, -50, seconds(15)));
+  const tail = results.slice(-20);
+  assert.ok(
+    tail.every((r) => r.onsetRate >= 1),
+    `commentary should show word onsets, got ${tail[0].onsetRate}`
+  );
+});

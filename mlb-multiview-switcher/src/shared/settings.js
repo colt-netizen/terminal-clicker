@@ -28,6 +28,9 @@
     // Team names/abbreviations, best first ("SD", "Padres", ...). Outranks the
     // per-feed list: a game featuring a ranked team beats any unranked game.
     teamPriorities: [],
+    // Manual pane->gamePk assignments from the popup, for layouts where
+    // automatic identification has nothing to read. {paneKey: gamePk}
+    paneAssignments: {},
     // Swap panes showing dead games (final / not started) for live games found
     // on the rail. The point of knowing every game's state.
     autoTune: true,

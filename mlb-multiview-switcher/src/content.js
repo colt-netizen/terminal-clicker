@@ -497,7 +497,7 @@
 
     const lines = [
       `v${chrome.runtime.getManifest().version}  phase ${machine.phase}${info.replayMode ? '   mode replay-night' : ''}`,
-      `signal   ${info.source}${info.listening ? ` ${info.recentDb}dB spread ${info.spreadDb ?? '?'}dB / floor ${info.floorDb}dB` : ''}`,
+      `signal   ${info.source}${info.listening ? ` ${info.recentDb}dB spread ${info.spreadDb ?? '?'}dB conf ${info.conf ?? '?'} / floor ${info.floorDb}dB` : ''}`,
       `audible  ${info.audible}`,
       `panes    ${info.totalPanes}   rail ${info.railCards ?? 0} cards   api ${info.apiGames ?? 0} games`,
     ];
@@ -533,8 +533,10 @@
       primaryLocal: primaryIndex(panes),
     };
     // The rail scan walks a lot of DOM, so run it at a third of the report
-    // rate, and only from the top frame (the rail lives in the main document).
-    if (isCoordinator && reportCount % 3 === 0) {
+    // rate. Every frame scans: MLB's player (rail included) lives in an
+    // iframe, and gating this on the top frame is why the rail was never
+    // found no matter how good the scan got.
+    if (reportCount % 3 === 0) {
       message.rail = scanRail().map((c) => ({ text: c.text, tokens: c.tokens, viewing: c.viewing }));
     }
     reportCount += 1;
