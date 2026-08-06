@@ -25,10 +25,11 @@
  * lives in the content script and this is woken by its messages.
  */
 
-importScripts('shared/pane-selector.js', 'shared/settings.js', 'shared/game-intel.js');
+importScripts('shared/pane-selector.js', 'shared/settings.js', 'shared/game-intel.js', 'shared/broadcast-align.js');
 const Selector = globalThis.MLBPaneSelector;
 const Settings = globalThis.MLBSettings;
 const Intel = globalThis.MLBGameIntel;
+const Align = globalThis.MLBBroadcastAlign;
 
 /** tabId -> Map<frameId, {panes, primaryLocal, ts}> */
 const frames = new Map();
@@ -152,6 +153,78 @@ const paneHeat = new Map();
 /** tabId -> timestamp of the last promotion. */
 const lastSwitch = new Map();
 
+// -------------------------------------------------- broadcast alignment
+//
+// Predictive ad windows for replays: play-by-play timestamps give every ad
+// window of a finished game; one or two confirmed breaks on a pane solve the
+// offset between playback position and the broadcast clock; after that the
+// pane's ads are known in advance and it is escaped/avoided with no sensing.
+
+/** gamePk -> {windows, at} — immutable for finals, fetched once. */
+const pbpCache = new Map();
+const pbpFetching = new Set();
+function ensureAdWindows(gamePk) {
+  if (!gamePk || pbpCache.has(gamePk) || pbpFetching.has(gamePk)) return;
+  pbpFetching.add(gamePk);
+  (async () => {
+    try {
+      const res = await fetch(`https://statsapi.mlb.com/api/v1/game/${gamePk}/playByPlay`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      pbpCache.set(gamePk, { windows: Align.adWindows(data), at: Date.now() });
+    } catch {
+      pbpCache.set(gamePk, { windows: [], at: Date.now() }); // don't refetch-loop
+    } finally {
+      pbpFetching.delete(gamePk);
+    }
+  })();
+}
+
+/** tabId -> Map<affKey, {sets: [...], offset: number|null}> */
+const alignments = new Map();
+/** tabId -> Map<paneKey, {posMs, at}> — latest playback positions. */
+const panePos = new Map();
+
+function alignmentFor(tabId, affKey) {
+  let m = alignments.get(tabId);
+  if (!m) {
+    m = new Map();
+    alignments.set(tabId, m);
+  }
+  let a = m.get(affKey);
+  if (!a) {
+    a = { sets: [], offset: null };
+    m.set(affKey, a);
+  }
+  return a;
+}
+
+/**
+ * A break was CONFIRMED on this pane (audio evidence or a user click-away).
+ * Feed the alignment solver; with enough detections the offset resolves and
+ * prediction takes over.
+ */
+function feedBreakDetection(tabId, pane) {
+  if (!pane || !pane.gamePk || pane.kind !== 'final') return;
+  const entry = pbpCache.get(pane.gamePk);
+  if (!entry || !entry.windows.length) return;
+  const pos = panePos.get(tabId) ? panePos.get(tabId).get(pane.key) : null;
+  if (!pos || Date.now() - pos.at > 10000) return;
+  const a = alignmentFor(tabId, pane.affKey);
+  if (a.offset !== null) return; // already solved
+  a.sets.push(Align.offsetCandidates(entry.windows, pos.posMs));
+  if (a.sets.length > 5) a.sets = a.sets.slice(-5);
+  const resolved = Align.resolveOffset(a.sets);
+  if (resolved) {
+    a.offset = resolved.offset;
+    logEvent(tabId, 'alignment-resolved', {
+      pane: pane.key,
+      gamePk: pane.gamePk,
+      support: resolved.support,
+    });
+  }
+}
+
 // ------------------------------------------------------------- decision log
 //
 // A flight recorder for every decision: what was known about each pane, the
@@ -190,6 +263,7 @@ function snapPane(p) {
     state: p.stateText || p.kind || '?',
     live: p.live,
     brk: p.inBreak,
+    predAd: Boolean(p.predictedAd),
     cool: p.cooling,
     heat: p.heated,
     paused: p.paused,
@@ -362,6 +436,16 @@ function paneList(tabId, now, opts) {
   for (const frame of liveFrames(tabId, now)) {
     (frame.panes || []).forEach((pane, local) => {
       const tokens = pane.tokens && pane.tokens.length ? pane.tokens : Intel.tokensFromKey(pane.key);
+      // Track playback position for the alignment solver.
+      if (pane.posMs != null) {
+        let posMap = panePos.get(tabId);
+        if (!posMap) {
+          posMap = new Map();
+          panePos.set(tabId, posMap);
+        }
+        posMap.set(pane.key, { posMs: pane.posMs, at: now });
+      }
+
       const assignedPk = assignments[pane.key];
       const game =
         Intel.matchByKey(games, pane.key) ||
@@ -381,7 +465,7 @@ function paneList(tabId, now, opts) {
       // (a trusted, fully-elapsed break episode): the top pane is exempt from
       // cooling but never from heat.
       const heated = heatMap ? (heatMap.get(pane.key) || 0) > now : false;
-      const inBreak = episode.inBreak;
+      let inBreak = episode.inBreak;
       const cooling = episode.cooling;
       pane = { ...pane, inBreak };
 
@@ -390,6 +474,23 @@ function paneList(tabId, now, opts) {
         const mine = new Set(tokens.map(Intel.normalizeToken));
         const card = cards.find((c) => (c.tokens || []).filter((t) => mine.has(Intel.normalizeToken(t))).length >= 2);
         if (card) railState = Intel.parseRailState(card.text);
+      }
+
+      // Predictive ad windows: for a finished game with a solved alignment,
+      // the pane's ads are known from the broadcast timeline — no sensing.
+      let predictedAd = false;
+      if (game && Intel.classifyApiGame(game) === 'final') {
+        ensureAdWindows(game.gamePk);
+        const entry = pbpCache.get(game.gamePk);
+        const aMap = alignments.get(tabId);
+        const a = aMap ? aMap.get(`${pane.key}|${game.gamePk}`) : null;
+        if (entry && entry.windows.length && a && a.offset !== null && pane.posMs != null) {
+          predictedAd = Align.inAdWindow(entry.windows, a.offset, pane.posMs);
+          if (predictedAd) {
+            inBreak = true;
+            pane = { ...pane, inBreak: true };
+          }
+        }
       }
 
       let liveness = Intel.paneLiveness({ ...pane, railState }, game);
@@ -431,6 +532,7 @@ function paneList(tabId, now, opts) {
         paused: Boolean(game) && Intel.betweenInnings(game),
         // Recently showed a break: never a destination until cooled.
         cooling,
+        predictedAd,
         // Escaped for silence recently: never a destination, not even for
         // the top-priority pane.
         heated,
@@ -788,6 +890,11 @@ async function evaluate(tabId, { audioDead, blocked }) {
           paneHeat.set(tabId, heatMap);
         }
         heatMap.set(departed.key, now + AUDIO_ESCAPE_HEAT_MS);
+        feedBreakDetection(tabId, departed);
+      }
+      // A break-banner escape is also a confirmed break at a known position.
+      if (result.ok && departed && decision.reason === 'current pane is on a commercial break') {
+        feedBreakDetection(tabId, departed);
       }
     }
   }
@@ -846,6 +953,7 @@ async function userSelect(tabId, frameId, local) {
       paneHeat.set(tabId, heatMap);
     }
     heatMap.set(abandoned.key, now + CLICK_AWAY_HEAT_MS);
+    feedBreakDetection(tabId, abandoned);
   }
 
   logEvent(tabId, 'click-correction', {
@@ -1013,6 +1121,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             live: p.live,
             liveReason: p.liveReason,
             inBreak: p.inBreak,
+            predAd: Boolean(p.predictedAd),
             cooling: p.cooling,
             isPrimary: p.isPrimary,
             lean: Math.round(p.affinity * 10) / 10,
@@ -1122,6 +1231,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   cursor.delete(tabId);
   aliveScore.delete(tabId);
   lastAlive.delete(tabId);
+  alignments.delete(tabId);
+  panePos.delete(tabId);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {

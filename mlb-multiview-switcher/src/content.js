@@ -505,7 +505,7 @@
     (info.panes || []).forEach((p, i) => {
       const marks = [
         p.stateText || '?',
-        p.inBreak ? 'BREAK' : p.cooling ? 'cooling' : p.live ? 'live' : info.replayMode ? 'replay' : `dead: ${p.liveReason}`,
+        p.inBreak ? (p.predAd ? 'AD (predicted)' : 'BREAK') : p.cooling ? 'cooling' : p.live ? 'live' : info.replayMode ? 'replay' : `dead: ${p.liveReason}`,
         p.lean ? `lean ${p.lean > 0 ? '+' : ''}${p.lean}` : '',
         p.isPrimary ? 'audio' : '',
       ].filter(Boolean);
@@ -530,6 +530,9 @@
         tokens: p.tokens,
         text: p.text,
         inBreak: p.inBreak,
+        // Playback position (ms). Readable even on DRM streams, and the key
+        // to predictive ad windows on replays.
+        posMs: Number.isFinite(p.video.currentTime) ? Math.round(p.video.currentTime * 1000) : null,
       })),
       primaryLocal: primaryIndex(panes),
     };
