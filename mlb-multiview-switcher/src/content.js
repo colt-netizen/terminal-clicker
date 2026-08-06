@@ -419,6 +419,108 @@
     });
   }
 
+  // ------------------------------------------- push-to-main (focus layout)
+
+  /**
+   * MLB's "focus" multiview layout: one large main stage plus small side
+   * tiles, where each tile carries a swap control that pushes its feed onto
+   * the stage. Returns the stage's pane index, or null in the ordinary grid.
+   */
+  function focusLayout(panes) {
+    if (panes.length < 2) return null;
+    const areas = panes.map((p) => area(p.container.getBoundingClientRect()));
+    const max = Math.max(...areas);
+    const main = areas.indexOf(max);
+    // The stage must dwarf every tile, or this is just a ragged grid.
+    return areas.every((a, i) => i === main || (a > 0 && max / a >= 2.5)) ? main : null;
+  }
+
+  /** Tile controls only render on hover; convince the tile it is hovered. */
+  function synthesizeHover(container) {
+    const r = container.getBoundingClientRect();
+    const clientX = r.left + r.width / 2;
+    const clientY = r.top + r.height / 2;
+    const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY };
+    const target = document.elementFromPoint(clientX, clientY) || container;
+    for (const type of ['pointerover', 'pointerenter', 'pointermove']) {
+      target.dispatchEvent(new PointerEvent(type, { ...base, pointerId: 1, pointerType: 'mouse' }));
+    }
+    for (const type of ['mouseover', 'mouseenter', 'mousemove']) {
+      target.dispatchEvent(new MouseEvent(type, base));
+    }
+  }
+
+  const SWAP_HINT = /swap|switch|main|stage|feature|expand|promote|move|primary/i;
+  const CLOSE_HINT = /close|remove|dismiss|exit|✕|×/i;
+
+  /**
+   * The tile's swap control. Prefer an explicit label; with no labels, two
+   * side-by-side controls mean swap-arrows LEFT of the close ✕ (the observed
+   * layout). One lone unlabelled button is never worth the gamble — a wrong
+   * guess closes the user's tile.
+   */
+  function findSwapButton(container) {
+    const rect = container.getBoundingClientRect();
+    const candidates = deepQueryAll('button, [role="button"]', container)
+      .map((el) => {
+        const r = el.getBoundingClientRect();
+        const label = `${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''} ${(
+          el.textContent || ''
+        ).slice(0, 40)}`;
+        return { el, r, label };
+      })
+      .filter(
+        ({ r }) =>
+          r.width > 8 && r.height > 8 && centreInside(rect, r) && r.top < rect.top + rect.height / 2
+      );
+    const labelled = candidates.find((c) => SWAP_HINT.test(c.label) && !CLOSE_HINT.test(c.label));
+    if (labelled) return labelled.el;
+    const unlabelled = candidates.filter((c) => !CLOSE_HINT.test(c.label));
+    if (unlabelled.length >= 2) {
+      unlabelled.sort((a, b) => a.r.left - b.r.left);
+      return unlabelled[0].el;
+    }
+    return null;
+  }
+
+  /**
+   * Swap a side tile's feed onto the main stage, then follow it: after the
+   * swap the feed lives at a different pane index, so re-find it by tokens
+   * and re-aim the audio enforcement. Only re-aims on a VERIFIED landing —
+   * an unverified guess would move audio to the wrong feed.
+   */
+  async function pushToMain(local) {
+    const panes = discoverPanes();
+    const main = focusLayout(panes);
+    if (main === null) return { attempted: false, reason: 'grid layout' };
+    if (main === local) return { attempted: false, reason: 'already main' };
+    const pane = panes[local];
+    if (!pane) return { attempted: false, reason: 'pane gone' };
+
+    synthesizeHover(pane.container);
+    await sleep(250);
+    const button = findSwapButton(pane.container);
+    if (!button) return { attempted: false, reason: 'no swap control found' };
+
+    const wantTokens = pane.tokens || [];
+    realClick(button);
+    await sleep(900);
+
+    const after = discoverPanes();
+    const nowMain = focusLayout(after);
+    let landed = null;
+    if (wantTokens.length) {
+      const i = after.findIndex((p) => wantTokens.every((t) => (p.tokens || []).includes(t)));
+      if (i >= 0) landed = i;
+    }
+    const ok = nowMain !== null && landed !== null && landed === nowMain;
+    if (landed !== null) {
+      desired = landed;
+      enforceAudio();
+    }
+    return { attempted: true, ok, newLocal: landed };
+  }
+
   /** Jump a live feed to its live edge (a few seconds back from the boundary
    * so the player has buffer to stand on). Only called for games the API says
    * are in progress — never for finals, where the position is someone's
@@ -436,7 +538,7 @@
     }
   }
 
-  async function promote(local, goLive) {
+  async function promote(local, goLive, pushMain) {
     const panes = discoverPanes();
     const pane = panes[local];
     if (!pane) return { ok: false, reason: 'pane index out of range' };
@@ -455,7 +557,15 @@
     }
 
     lastAction = `promoted ${pane.label}`;
-    return { ok: true, label: pane.label };
+    // In the focus layout, take the big screen with the audio: swap the
+    // audible tile onto the main stage. User clicks are exempt — clicking a
+    // tile to peek at it is not a request to rearrange the layout.
+    let swap = null;
+    if (pushMain && settings.pushToMain !== false) {
+      swap = await pushToMain(local).catch(() => null);
+      if (swap && swap.ok) lastAction = `promoted ${pane.label} → main stage`;
+    }
+    return { ok: true, label: pane.label, swap };
   }
 
   function demote() {
@@ -588,7 +698,7 @@
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'promote') {
-      promote(msg.local, msg.goLive).then(sendResponse);
+      promote(msg.local, msg.goLive, msg.pushMain).then(sendResponse);
       return true;
     }
     if (msg.type === 'demote') {
@@ -622,6 +732,13 @@
     Settings.onChange((next) => {
       settings = next;
     });
+
+    // A REAL page boot (refresh or top-level navigation) is the only event
+    // that should soft-reset the worker's session state. The tab's `loading`
+    // status is useless for this — MLB's feed iframes reload constantly and
+    // flip it mid-session, which silently wiped holds, locks, heat and
+    // learning while the user watched.
+    if (isCoordinator) toWorker({ type: 'pageBoot' });
 
     // A real user click on a pane is the strongest signal there is: adopt it
     // as the enforced audio target immediately (before the worker even hears

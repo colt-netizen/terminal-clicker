@@ -34,6 +34,10 @@
     // Swap panes showing dead games (final / not started) for live games found
     // on the rail. The point of knowing every game's state.
     autoTune: true,
+    // Focus layout (one main stage + side tiles): when the switcher moves
+    // audio to a tile, press the tile's swap control so the audible game
+    // takes the main stage with it. User clicks never rearrange the layout.
+    pushToMain: true,
     // CSS selector for rail game cards, same escape-hatch idea as paneSelector.
     railSelector: '',
     // Analyse captured tab audio to notice when commentary stops even without a

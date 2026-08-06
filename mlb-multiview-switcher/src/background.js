@@ -654,21 +654,45 @@ async function promoteIndex(tabId, panes, index, options) {
   lastAlive.set(tabId, Date.now()); // fresh pane, fresh evidence clock
   aliveScore.set(tabId, 0.5);
 
-  placedBy.set(tabId, (options && options.source) || 'extension');
+  const source = (options && options.source) || 'extension';
+  placedBy.set(tabId, source);
   const goLive = options && 'goLive' in options ? options.goLive : Boolean(target.gameLive);
+  let targetSend = null;
   const sends = liveFrames(tabId, Date.now()).map((frame) => {
     const message =
       frame.frameId === target.frameId
         ? // goLive: for a game the API says is in progress, snap the feed to
           // the live edge on arrival. Never for finals — that's someone's
           // replay position.
-          { type: 'promote', local: target.local, goLive }
+          // pushMain: in the focus layout, our own placements also swap the
+          // audible tile onto the main stage. User clicks never rearrange.
+          { type: 'promote', local: target.local, goLive, pushMain: source !== 'user' }
         : { type: 'demote' };
-    return chrome.tabs
+    const send = chrome.tabs
       .sendMessage(tabId, message, { frameId: frame.frameId })
       .catch(() => null); // a frame can vanish mid-switch; not fatal
+    if (frame.frameId === target.frameId) targetSend = send;
+    return send;
   });
   await Promise.all(sends);
+
+  // The focus-layout swap moved the feed to a new pane index; follow it so
+  // the cursor keeps pointing at the game that carries the audio.
+  const promoted = targetSend ? await targetSend : null;
+  const swap = promoted && promoted.swap;
+  if (swap && swap.attempted) {
+    logEvent(tabId, 'push-main', {
+      ok: Boolean(swap.ok),
+      pane: target.label,
+      newLocal: swap.newLocal ?? null,
+    });
+  }
+  if (swap && swap.ok && Number.isInteger(swap.newLocal)) {
+    const landed = panes.findIndex(
+      (p) => p.frameId === target.frameId && p.local === swap.newLocal
+    );
+    if (landed >= 0) cursor.set(tabId, landed);
+  }
   return { ok: true, index, label: target.label };
 }
 
@@ -979,9 +1003,17 @@ async function rotate(tabId) {
 /** The user physically clicked a pane: adopt it, hold it, and reconcile every
  * frame's enforcement to it. No goLive snap — clicking to look at a pane is
  * not a request to lose your place in it. */
+/** tabId -> {at, frameId, local}: one physical click can surface twice
+ * (pointer replays across shadow boundaries); the echo must not re-run the
+ * heat/lean bookkeeping. */
+const lastUserSelect = new Map();
+
 async function userSelect(tabId, frameId, local) {
   const settings = await currentSettings();
   const now = Date.now();
+  const prev = lastUserSelect.get(tabId);
+  if (prev && prev.frameId === frameId && prev.local === local && now - prev.at < 400) return;
+  lastUserSelect.set(tabId, { at: now, frameId, local });
   const panes = paneList(tabId, now, settings);
   const index = panes.findIndex((p) => p.frameId === frameId && p.local === local);
   if (index === -1) return;
@@ -1160,6 +1192,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return respond(sendResponse, () => evaluate(tabId, msg));
     }
 
+    // The top frame's content script booted: a genuine refresh/navigation.
+    case 'pageBoot': {
+      if (tabId == null) return false;
+      if ((sender.frameId ?? 0) === 0) softReset(tabId);
+      return false;
+    }
+
     // A real (isTrusted) click landed on a pane.
     case 'userSelect': {
       if (tabId == null) return false;
@@ -1283,10 +1322,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-// Soft reset on refresh/navigation: learned lean, holds, heat and break
-// episodes belong to the session that taught them.
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status !== 'loading') return;
+// Soft reset on a REAL page boot (the top frame's content script starting):
+// learned lean, holds, heat and break episodes belong to the session that
+// taught them. This used to hang off tabs.onUpdated's `loading` status, but
+// Chrome flips that on SUBFRAME navigations too — and MLB's player reloads
+// feed iframes constantly, so the reset fired mid-session and silently wiped
+// the user's hold, the user lock, and every pane's heat while they watched.
+// The flight recorder showed exactly that: locks and heat vanishing seconds
+// after being set, with the rest of the session state intact.
+function softReset(tabId) {
   paneAffinity.delete(tabId);
   placedBy.delete(tabId);
   manualHold.delete(tabId);
@@ -1298,7 +1342,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   alignments.delete(tabId);
   panePos.delete(tabId);
   userLockUntil.delete(tabId);
-});
+}
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   frames.delete(tabId);
