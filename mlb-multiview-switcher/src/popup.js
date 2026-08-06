@@ -4,6 +4,12 @@ const $ = (id) => document.getElementById(id);
 
 let settings = null;
 let tabId = null;
+// While the user has a dropdown open, re-rendering would destroy it mid-
+// interaction (the popup refreshes every second) — that was the "dropdown
+// disappears after half a second and picking does nothing" bug.
+let uiLocked = false;
+let paneSig = '';
+let gamesSig = '';
 
 async function activeTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -95,9 +101,18 @@ async function addTeam(raw) {
 // ------------------------------------------------------------------- panes
 
 function renderPanes(state) {
+  if (uiLocked) return;
   const list = $('panes');
-  list.innerHTML = '';
   const panes = (state && state.panes) || [];
+  // Rebuild only when content actually changed; a static list never eats a click.
+  const sig = JSON.stringify([
+    panes.map((p) => [p.key, p.label, p.stateText, p.inBreak, p.cooling, p.live, p.isPrimary]),
+    settings.paneAssignments || {},
+    ((state && state.games && state.games.all) || []).map((g) => g.gamePk),
+  ]);
+  if (sig === paneSig) return;
+  paneSig = sig;
+  list.innerHTML = '';
   if (!panes.length) {
     list.appendChild(el('li', 'empty', 'No games detected yet.'));
     return;
@@ -123,7 +138,14 @@ function renderPanes(state) {
       select.appendChild(new Option(`${game.matchup} (${game.state})`, String(game.gamePk)));
     }
     select.value = assignments[pane.key] ? String(assignments[pane.key]) : '';
+    select.addEventListener('focus', () => {
+      uiLocked = true;
+    });
+    select.addEventListener('blur', () => {
+      uiLocked = false;
+    });
     select.addEventListener('change', async () => {
+      uiLocked = false;
       const next = { ...(settings.paneAssignments || {}) };
       if (select.value) next[pane.key] = Number(select.value);
       else delete next[pane.key];
@@ -147,9 +169,17 @@ function startTime(iso) {
 }
 
 function renderGames(state) {
+  if (uiLocked) return;
   const list = $('games');
-  list.innerHTML = '';
   const games = state && state.games;
+  const sig = JSON.stringify([
+    games && games.live ? games.live.map((g) => [g.gamePk, g.state]) : [],
+    games && games.upcoming ? games.upcoming.map((g) => g.gamePk) : [],
+    settings.teamPriorities || [],
+  ]);
+  if (sig === gamesSig) return;
+  gamesSig = sig;
+  list.innerHTML = '';
   if (!games || (!games.live.length && !games.upcoming.length)) {
     list.appendChild(el('li', 'empty', games && games.apiError ? 'Stats API unreachable.' : 'No games right now.'));
     return;
